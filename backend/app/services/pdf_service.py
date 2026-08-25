@@ -271,6 +271,78 @@ class _EntityType:
     OTHER = "other"
 
 
+def _merge_split_beam_labels(text_blocks: list[dict]) -> list[dict]:
+    """
+    Merge beam labels that are split across adjacent text blocks.
+
+    In some PDFs, the beam ID and dimensions are on separate lines:
+      Block 1: "B19"       at (100, 530)
+      Block 2: "(230X600)" at (100, 545)
+
+    This function detects such pairs and merges them into a single block:
+      "B19(230X600)" at the position of the first block.
+
+    Also handles formats like:
+      "B19" + "(230X600)" -> "B19(230X600)"
+      "B19" + "230X600"   -> "B19(230X600)"
+    """
+    import math
+
+    beam_id_pattern = re.compile(r"^(B\d+[a-zA-Z]?)$")
+    dim_pattern = re.compile(r"^\(?(\d{2,4})\s*[xX×]\s*(\d{2,4})\)?$")
+
+    merged = []
+    skip_indices = set()
+
+    for i, block in enumerate(text_blocks):
+        if i in skip_indices:
+            continue
+
+        text = block["text"].strip()
+        id_match = beam_id_pattern.match(text)
+
+        if id_match:
+            beam_id = id_match.group(1)
+            found_dim = False
+
+            for j in range(i + 1, min(i + 5, len(text_blocks))):
+                if j in skip_indices:
+                    continue
+                other = text_blocks[j]
+                if other["page"] != block["page"]:
+                    continue
+
+                dist = math.hypot(
+                    (block["x0"] + block["x1"]) / 2 - (other["x0"] + other["x1"]) / 2,
+                    (block["y0"] + block["y1"]) / 2 - (other["y0"] + other["y1"]) / 2,
+                )
+
+                if dist > 80:
+                    continue
+
+                dim_match = dim_pattern.match(other["text"].strip())
+                if dim_match:
+                    merged_text = f"{beam_id}({dim_match.group(1)}X{dim_match.group(2)})"
+                    merged.append({
+                        "text": merged_text,
+                        "x0": block["x0"],
+                        "y0": block["y0"],
+                        "x1": max(block["x1"], other["x1"]),
+                        "y1": max(block["y1"], other["y1"]),
+                        "page": block["page"],
+                    })
+                    skip_indices.add(j)
+                    found_dim = True
+                    break
+
+            if not found_dim:
+                merged.append(block)
+        else:
+            merged.append(block)
+
+    return merged
+
+
 def classify_text_entities(text_blocks: list[dict]) -> list[dict]:
     """
     Parse all text blocks into typed structural entities with coordinates.
@@ -298,6 +370,18 @@ def classify_text_entities(text_blocks: list[dict]) -> list[dict]:
         if beam:
             entity["type"] = _EntityType.BEAM_LABEL
             entity["data"] = beam
+            entities.append(entity)
+            continue
+
+        # Fallback beam label: "B19 230X600" or "B19 230x600" (no parentheses)
+        beam_alt = re.match(r"(B\d+[a-zA-Z]?)\s+(\d{2,4})\s*[xX×]\s*(\d{2,4})", text)
+        if beam_alt:
+            entity["type"] = _EntityType.BEAM_LABEL
+            entity["data"] = {
+                "beam_id": beam_alt.group(1),
+                "width": int(beam_alt.group(2)),
+                "depth": int(beam_alt.group(3)),
+            }
             entities.append(entity)
             continue
 
@@ -731,13 +815,31 @@ async def analyze_pdf_hybrid(
     to full LLM vision for raster/scanned PDFs).
     """
     text_blocks = extract_text_blocks(filepath)
+    print(f"[Hybrid] OCR extracted {len(text_blocks)} text blocks from PDF")
+
+    # Try to merge split beam labels (e.g., "B19" on one line, "(230X600)" on next)
+    text_blocks = _merge_split_beam_labels(text_blocks)
 
     entities = classify_text_entities(text_blocks)
+
+    beam_count = sum(1 for e in entities if e["type"] == _EntityType.BEAM_LABEL)
+    bar_count = sum(1 for e in entities if e["type"] == _EntityType.BAR_SPEC)
+    stirrup_count = sum(1 for e in entities if e["type"] == _EntityType.STIRRUP_SPEC)
+    print(f"[Hybrid] Classified: {beam_count} beam labels, {bar_count} bar specs, {stirrup_count} stirrups")
+
+    if beam_count == 0:
+        # Log sample text blocks to help debug
+        sample = [b["text"] for b in text_blocks[:20]]
+        print(f"[Hybrid] No beam labels found. Sample text blocks: {sample}")
+        return []
 
     beam_groups = assign_entities_to_beams(entities)
 
     if not beam_groups:
         return []
+
+    for bid, grp in beam_groups.items():
+        print(f"[Hybrid] {bid}: {len(grp['bars'])} bars, {len(grp['stirrups'])} stirrups, {len(grp['spacings'])} spacings")
 
     elements = build_elements_from_spatial(beam_groups)
 
