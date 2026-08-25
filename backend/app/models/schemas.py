@@ -37,8 +37,9 @@ class BeamReinforcementDetail(BaseModel):
     top_straight: Optional[list[RebarLayer]] = None  # bars running full span at top
     top_extra_support: Optional[list[RebarLayer]] = None  # extra/cranked bars at supports (hogging)
     side_face: Optional[list[RebarLayer]] = None  # side face reinforcement (for deep beams D>750)
-    stirrup_end_zone: Optional[dict] = None  # {"dia": 8, "spacing": 100, "zone_length_mm": 900}
-    stirrup_mid_zone: Optional[dict] = None  # {"dia": 8, "spacing": 150, "zone_length_mm": 2200}
+    stirrup_end_zone: Optional[dict] = None  # {"dia": 8, "spacing": 200, "legs": 2, "zone_length_mm": 500}
+    stirrup_support_zone: Optional[dict] = None  # {"dia": 10, "spacing": 130, "legs": 4, "zone_length_mm": 1500}
+    stirrup_mid_zone: Optional[dict] = None  # {"dia": 10, "spacing": 150, "legs": 4, "zone_length_mm": 3000}
 
 
 class StructuralElement(BaseModel):

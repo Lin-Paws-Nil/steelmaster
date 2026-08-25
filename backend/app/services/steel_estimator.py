@@ -368,7 +368,6 @@ def _estimate_beam_detailed(element: StructuralElement, detail) -> list[RebarSpe
 
         stirrup_len = (stirrup_perimeter + hook_addition_fn(dia)) / 1000
         if legs > 2:
-            # Multi-legged: add inner leg lengths
             inner_leg_length = (depth - 2 * cover) / 1000
             stirrup_len += (legs - 2) * inner_leg_length
 
@@ -382,6 +381,30 @@ def _estimate_beam_detailed(element: StructuralElement, detail) -> list[RebarSpe
             weight_per_meter=wpm,
             total_weight=round(num_end * stirrup_len * wpm, 2),
             bar_type=f"stirrup end zone ({int(dia)}mm @{int(spacing)})",
+        ))
+
+    if detail.stirrup_support_zone:
+        sz = detail.stirrup_support_zone
+        dia = float(sz.get("dia", 10))
+        spacing = float(sz.get("spacing", 130))
+        legs = int(sz.get("legs", 2))
+        zone_len = float(sz.get("zone_length_mm", span / 4))
+
+        stirrup_len = (stirrup_perimeter + hook_addition_fn(dia)) / 1000
+        if legs > 2:
+            inner_leg_length = (depth - 2 * cover) / 1000
+            stirrup_len += (legs - 2) * inner_leg_length
+
+        # Number of stirrups in BOTH support zones
+        num_support = 2 * (math.ceil(zone_len / spacing) + 1)
+        wpm = get_weight(dia)
+        rebars.append(RebarSpec(
+            diameter=dia,
+            count=num_support,
+            length=round(stirrup_len, 2),
+            weight_per_meter=wpm,
+            total_weight=round(num_support * stirrup_len * wpm, 2),
+            bar_type=f"stirrup support zone ({int(dia)}mm @{int(spacing)})",
         ))
 
     if detail.stirrup_mid_zone:
@@ -408,7 +431,7 @@ def _estimate_beam_detailed(element: StructuralElement, detail) -> list[RebarSpe
         ))
 
     # If no stirrup detail provided but detail object exists, fall back to element-level stirrup
-    if not detail.stirrup_end_zone and not detail.stirrup_mid_zone:
+    if not detail.stirrup_end_zone and not detail.stirrup_support_zone and not detail.stirrup_mid_zone:
         stirrup_dia = element.stirrup_dia or 8
         stirrup_spacing = element.stirrup_spacing or 150
         stirrup_len = (stirrup_perimeter + hook_addition_fn(stirrup_dia)) / 1000

@@ -477,28 +477,33 @@ async def analyze_pdf_with_vision(
                         f"- Extra bars at supports are shown for partial length (cranked/curtailed)\n"
                         f"- Stirrup spacing often varies: closer spacing at ends (support zone), wider at mid-span\n\n"
                         f"FOR EACH BEAM, identify these SEPARATE bar groups:\n"
-                        f"1. BOTTOM STRAIGHT BARS: Full-span tension bars at bottom (e.g., 2K20 straight)\n"
-                        f"2. BOTTOM EXTRA AT MIDSPAN: Additional bars at mid-span only (e.g., 2K16 extra)\n"
-                        f"3. TOP STRAIGHT BARS: Full-span bars at top (e.g., 2K12 holding bars)\n"
-                        f"4. TOP EXTRA AT SUPPORTS: Cranked/curtailed bars at supports for hogging (e.g., 2K20 at L/4)\n"
-                        f"5. STIRRUPS END ZONE: Closer spacing near supports (e.g., K8@100 for L/4 from each end)\n"
-                        f"6. STIRRUPS MID ZONE: Wider spacing at center (e.g., K8@150 for middle half)\n"
-                        f"7. SIDE FACE BARS: If beam depth >= 750mm (e.g., 2K12 on each side face)\n\n"
+                        f"1. BOTTOM STRAIGHT BARS: Full-span tension bars at bottom (e.g., 4K20 straight)\n"
+                        f"2. BOTTOM EXTRA AT MIDSPAN: Additional bars at mid-span only (e.g., 4K16 extra)\n"
+                        f"3. TOP STRAIGHT BARS: Full-span bars at top (e.g., 4K16 holding bars)\n"
+                        f"4. TOP EXTRA AT SUPPORTS: Cranked/curtailed bars at supports for hogging (e.g., 4K20 at L/4)\n"
+                        f"5. STIRRUPS END ZONE: Lighter stirrups at the very ends of beam (e.g., K8@200C/C)\n"
+                        f"6. STIRRUPS SUPPORT ZONE: Heavier/closer stirrups near supports (e.g., 4L-K10@130C/C)\n"
+                        f"7. STIRRUPS MID ZONE: Wider spacing at center (e.g., K10@150C/C for middle portion)\n"
+                        f"8. SIDE FACE BARS: If beam depth >= 750mm (e.g., 2K12 on each side face)\n\n"
+                        f"CRITICAL: The 'count' field MUST be the EXACT number from the drawing notation.\n"
+                        f"If drawing shows 4K20, then count=4. If 6K16, then count=6. Do NOT split or halve the count across zones.\n"
+                        f"Each bar group gets the FULL count as written in the notation.\n\n"
                         f"Return JSON:\n"
                         f'{{"elements": [\n'
                         f'  {{\n'
-                        f'    "label": "B1",\n'
-                        f'    "length": 5000,\n'
+                        f'    "label": "B11",\n'
+                        f'    "length": 6000,\n'
                         f'    "bottom_bar_dia": 20, "bottom_bar_count": 4,\n'
-                        f'    "top_bar_dia": 16, "top_bar_count": 2,\n'
-                        f'    "stirrup_dia": 8, "stirrup_spacing": 150,\n'
+                        f'    "top_bar_dia": 16, "top_bar_count": 4,\n'
+                        f'    "stirrup_dia": 10, "stirrup_spacing": 130,\n'
                         f'    "reinforcement_detail": {{\n'
-                        f'      "bottom_straight": [{{"diameter": 20, "count": 2, "position": "bottom", "zone": "full"}}],\n'
-                        f'      "bottom_extra_midspan": [{{"diameter": 16, "count": 2, "position": "bottom", "zone": "mid-span"}}],\n'
-                        f'      "top_straight": [{{"diameter": 12, "count": 2, "position": "top", "zone": "full"}}],\n'
-                        f'      "top_extra_support": [{{"diameter": 20, "count": 2, "position": "top", "zone": "both-supports"}}],\n'
-                        f'      "stirrup_end_zone": {{"dia": 8, "spacing": 100, "legs": 2, "zone_length_mm": 1250}},\n'
-                        f'      "stirrup_mid_zone": {{"dia": 8, "spacing": 150, "legs": 2, "zone_length_mm": 2500}},\n'
+                        f'      "bottom_straight": [{{"diameter": 20, "count": 4, "position": "bottom", "zone": "full"}}],\n'
+                        f'      "bottom_extra_midspan": [{{"diameter": 16, "count": 4, "position": "bottom", "zone": "mid-span"}}],\n'
+                        f'      "top_straight": [{{"diameter": 16, "count": 4, "position": "top", "zone": "full"}}],\n'
+                        f'      "top_extra_support": [{{"diameter": 20, "count": 4, "position": "top", "zone": "both-supports"}}],\n'
+                        f'      "stirrup_end_zone": {{"dia": 8, "spacing": 200, "legs": 2, "zone_length_mm": 500}},\n'
+                        f'      "stirrup_support_zone": {{"dia": 10, "spacing": 130, "legs": 4, "zone_length_mm": 1500}},\n'
+                        f'      "stirrup_mid_zone": {{"dia": 10, "spacing": 150, "legs": 4, "zone_length_mm": 3000}},\n'
                         f'      "side_face": null\n'
                         f'    }}\n'
                         f'  }},\n'
@@ -507,9 +512,12 @@ async def analyze_pdf_with_vision(
                         f"- You MUST output ALL {beam_count} beams. Do NOT skip any.\n"
                         f"- The label must EXACTLY match: {', '.join(b.get('label','') for b in beam_labels)}\n"
                         f"- Read the span/length from dimension lines if visible (in mm)\n"
-                        f"- If stirrup zones are not separately shown, use the same spacing for both zones\n"
-                        f"- stirrup_end_zone.zone_length_mm = span/4 (approx L/4 from each support)\n"
-                        f"- stirrup_mid_zone.zone_length_mm = span/2 (middle portion)\n"
+                        f"- 'count' in reinforcement_detail = EXACT count from the notation (4K20 -> count=4, NOT 2)\n"
+                        f"- Stirrup zones: end_zone is the very ends, support_zone is near columns (heaviest), mid_zone is center\n"
+                        f"- If only two stirrup zones visible, set stirrup_end_zone to null and use support_zone + mid_zone\n"
+                        f"- If only one stirrup zone visible, set end_zone and support_zone to null, use mid_zone only\n"
+                        f"- stirrup_support_zone.zone_length_mm = approx L/4 from each support face\n"
+                        f"- stirrup_mid_zone.zone_length_mm = middle portion (span - 2*support_zone_length)\n"
                         f"- If you see 'EF' or 'EXTRA' near bar annotations, those are extra/curtailed bars\n"
                         f"- Include side_face bars only if depth >= 750mm\n"
                         f"- If reinforcement is not clearly visible for a beam, return null for those fields. Do NOT guess or assume values.\n"
@@ -574,6 +582,7 @@ async def analyze_pdf_with_vision(
                                 RebarLayer(**r) for r in (rd.get("side_face") or [])
                             ] or None,
                             stirrup_end_zone=rd.get("stirrup_end_zone"),
+                            stirrup_support_zone=rd.get("stirrup_support_zone"),
                             stirrup_mid_zone=rd.get("stirrup_mid_zone"),
                         )
 
