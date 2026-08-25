@@ -442,11 +442,10 @@ async def analyze_pdf_with_vision(
             print(f"Pass 1 found: {beam_count} beams")
 
             if beam_count == 0:
-                # Fallback: treat the whole response as elements list
-                if isinstance(labels_data, list) or labels_data.get("elements"):
-                    elements_data = labels_data if isinstance(labels_data, list) else labels_data.get("elements", [])
-                    all_elements.extend(_parse_elements_from_data(elements_data, page_idx))
-                    continue
+                raise ValueError(
+                    f"LLM Pass 1 failed to identify any beam labels on page {page_idx + 1}. "
+                    f"The drawing may not contain readable beam annotations or the LLM could not interpret them."
+                )
 
             # --- PASS 2: Get reinforcement details for each beam ---
             # Build a dimension lookup from Pass 1 (these are authoritative)
@@ -513,8 +512,7 @@ async def analyze_pdf_with_vision(
                         f"- stirrup_mid_zone.zone_length_mm = span/2 (middle portion)\n"
                         f"- If you see 'EF' or 'EXTRA' near bar annotations, those are extra/curtailed bars\n"
                         f"- Include side_face bars only if depth >= 750mm\n"
-                        f"- If reinforcement is not clearly visible for a beam, use reasonable defaults:\n"
-                        f"  bottom 2K16 straight + 2K12 extra, top 2K12, stirrup K8@150\n"
+                        f"- If reinforcement is not clearly visible for a beam, return null for those fields. Do NOT guess or assume values.\n"
                         f"- If multiple bar sizes at same position (e.g. 2K25+2K20 at bottom), list them as separate entries in the array"
                     ),
                 },
@@ -604,26 +602,11 @@ async def analyze_pdf_with_vision(
             all_elements.extend(page_elements)
             print(f"Pass 2 returned: {len(page_elements)} elements")
 
-            # Add any beams from Pass 1 that Pass 2 missed
+            # Log beams from Pass 1 that Pass 2 missed (do NOT inject defaults)
             found_labels = {e.label for e in page_elements}
-            for beam in beam_labels:
-                bl = beam.get("label", "")
-                if bl and bl not in found_labels:
-                    w, d = beam_dims.get(bl, (230, 450))
-                    all_elements.append(StructuralElement(
-                        element_type=ElementType.BEAM,
-                        label=bl,
-                        width=w,
-                        depth=d,
-                        length=4000,
-                        bottom_bar_dia=16,
-                        bottom_bar_count=2,
-                        top_bar_dia=12,
-                        top_bar_count=2,
-                        stirrup_dia=8,
-                        stirrup_spacing=150,
-                        quantity=1,
-                    ))
+            missed = [beam.get("label", "") for beam in beam_labels if beam.get("label", "") and beam.get("label", "") not in found_labels]
+            if missed:
+                print(f"Warning: Pass 2 missed beams identified in Pass 1: {missed}. No fallback data injected.")
 
         except httpx.TimeoutException:
             raise ValueError(f"LLM API timed out on page {page_idx + 1}. Try again.")
@@ -665,16 +648,27 @@ def _parse_json_response(content: str) -> dict:
 
 
 def _parse_elements_from_data(elements_data: list, page_idx: int) -> list[StructuralElement]:
-    """Parse a list of element dicts into StructuralElement objects."""
+    """Parse a list of element dicts into StructuralElement objects.
+    
+    Raises ValueError if any element is missing required fields (element_type, width, depth).
+    """
     elements = []
     for item in elements_data:
         try:
+            if "element_type" not in item:
+                raise ValueError(f"Missing required field 'element_type' in element: {item.get('label', 'unknown')}")
+            if "width" not in item or "depth" not in item:
+                raise ValueError(
+                    f"Missing required dimensions (width/depth) for element '{item.get('label', 'unknown')}'. "
+                    f"Got width={item.get('width')}, depth={item.get('depth')}"
+                )
+
             element = StructuralElement(
                 element_type=ElementType(item["element_type"]),
                 label=item.get("label", f"Page {page_idx+1} element"),
-                width=float(item.get("width", 300)),
-                depth=float(item.get("depth", 300)),
-                length=float(item.get("length", 3000)),
+                width=float(item["width"]),
+                depth=float(item["depth"]),
+                length=float(item["length"]) if item.get("length") else None,
                 main_bar_dia=float(item["main_bar_dia"]) if item.get("main_bar_dia") else None,
                 main_bar_count=int(item["main_bar_count"]) if item.get("main_bar_count") else None,
                 top_bar_dia=float(item["top_bar_dia"]) if item.get("top_bar_dia") else None,
@@ -687,8 +681,7 @@ def _parse_elements_from_data(elements_data: list, page_idx: int) -> list[Struct
             )
             elements.append(element)
         except (ValueError, KeyError) as e:
-            print(f"Skipping element: {e}")
-            continue
+            raise ValueError(f"Failed to parse element on page {page_idx + 1}: {e}")
     return elements
 
 

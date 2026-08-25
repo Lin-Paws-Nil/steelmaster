@@ -1,6 +1,5 @@
 """Upload router - handles DWG/DXF/PDF file uploads and parsing."""
 
-import os
 import uuid
 from pathlib import Path
 
@@ -99,7 +98,6 @@ async def upload_and_estimate(file: UploadFile = File(...), use_llm: bool = Fals
 
     elements = parse_result.elements_detected
     parse_method = parse_result.metadata.get("parse_method", "")
-    llm_error = None
 
     # For PDF files, always use vision LLM to analyze the drawing images
     if ext == ".pdf":
@@ -112,54 +110,60 @@ async def upload_and_estimate(file: UploadFile = File(...), use_llm: bool = Fals
                 if vision_elements:
                     elements = vision_elements
                 else:
-                    llm_error = "Vision API returned no elements. Check your LLM_API_KEY in .env"
+                    raise HTTPException(
+                        status_code=422,
+                        detail="Vision API returned no structural elements from the PDF. The drawing may not contain recognizable structural annotations."
+                    )
+            except HTTPException:
+                raise
+            except ValueError as e:
+                raise HTTPException(status_code=422, detail=f"PDF vision analysis failed: {str(e)}")
+            except ConnectionError as e:
+                raise HTTPException(status_code=503, detail=f"Cannot reach LLM service: {str(e)}")
             except Exception as e:
-                llm_error = str(e)
-                print(f"PDF vision analysis failed: {e}")
-                if not elements:
-                    elements = await interpret_drawing_with_llm(parse_result)
+                raise HTTPException(status_code=500, detail=f"Unexpected error during PDF vision analysis: {type(e).__name__}: {str(e)}")
 
     # For DWG/DXF files: use LLM only when fallback method was used or explicitly requested
     elif parse_method == "binary_fallback":
         if not elements:
-            elements = await interpret_drawing_with_llm(parse_result)
+            try:
+                elements = await interpret_drawing_with_llm(parse_result)
+            except (ValueError, ConnectionError, RuntimeError) as e:
+                raise HTTPException(status_code=422, detail=f"LLM interpretation failed for DWG binary fallback: {str(e)}")
         else:
-            elements = await enhance_elements_with_llm(
-                elements, parse_result=parse_result
-            )
+            try:
+                elements = await enhance_elements_with_llm(
+                    elements, parse_result=parse_result
+                )
+            except (ValueError, ConnectionError, RuntimeError) as e:
+                raise HTTPException(status_code=422, detail=f"LLM enhancement failed: {str(e)}")
 
     # For ACadSharp/ezdxf parsed files, optionally enhance with LLM
     elif use_llm:
         if not elements:
-            elements = await interpret_drawing_with_llm(parse_result)
+            try:
+                elements = await interpret_drawing_with_llm(parse_result)
+            except (ValueError, ConnectionError, RuntimeError) as e:
+                raise HTTPException(status_code=422, detail=f"LLM interpretation failed: {str(e)}")
         else:
-            elements = await enhance_elements_with_llm(
-                elements, parse_result=parse_result
-            )
+            try:
+                elements = await enhance_elements_with_llm(
+                    elements, parse_result=parse_result
+                )
+            except (ValueError, ConnectionError, RuntimeError) as e:
+                raise HTTPException(status_code=422, detail=f"LLM enhancement failed: {str(e)}")
 
     if not elements:
         if parse_method == "binary_fallback":
-            parse_result.layers = []
-            parse_result.raw_text_annotations = []
-            parse_result.element_count = 0
-            return {
-                "parse_result": parse_result,
-                "estimate": None,
-                "message": (
-                    "DWG file was read but its internal data could not be decoded. "
-                    "This is a limitation of the proprietary DWG format."
-                ),
-            }
+            raise HTTPException(
+                status_code=422,
+                detail="DWG file was read but its internal data could not be decoded. This is a limitation of the proprietary DWG format."
+            )
 
-        error_detail = f" Error: {llm_error}" if llm_error else ""
-        return {
-            "parse_result": parse_result,
-            "estimate": None,
-            "message": (
-                f"No structural elements could be detected.{error_detail} "
-                "Ensure your LLM_API_KEY is configured in .env for AI-powered analysis."
-            ),
-        }
+        raise HTTPException(
+            status_code=422,
+            detail="No structural elements could be detected from this file. Ensure the drawing contains readable structural annotations."
+        )
 
     estimate = estimate_project(
         project_name=file.filename or "Unnamed Project",

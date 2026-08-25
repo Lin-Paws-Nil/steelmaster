@@ -77,7 +77,7 @@ async def interpret_drawing_with_llm(
     model = model or os.getenv("LLM_MODEL", "gpt-4o")
 
     if not api_key:
-        return []
+        raise ValueError("No LLM API key configured. Set LLM_API_KEY or OPENAI_API_KEY environment variable.")
 
     ssl_verify = os.getenv("SSL_VERIFY", "true").lower() != "false"
 
@@ -182,9 +182,16 @@ For a typical building plan, ensure you include:
 
             return elements
 
+    except httpx.TimeoutException:
+        raise ValueError("LLM API request timed out after 90 seconds. The service may be overloaded.")
+    except httpx.ConnectError as e:
+        raise ConnectionError(f"Cannot connect to LLM API at {api_base}: {e}")
+    except httpx.HTTPStatusError as e:
+        raise ValueError(f"LLM API returned HTTP {e.response.status_code}: {e.response.text[:300]}")
+    except json.JSONDecodeError as e:
+        raise ValueError(f"LLM returned invalid JSON response: {e}")
     except Exception as e:
-        print(f"LLM interpretation failed: {e}")
-        return []
+        raise RuntimeError(f"LLM interpretation failed: {type(e).__name__}: {e}")
 
 
 async def enhance_elements_with_llm(
@@ -201,7 +208,7 @@ async def enhance_elements_with_llm(
     model = model or os.getenv("LLM_MODEL", "gpt-4o")
 
     if not api_key:
-        return elements
+        raise ValueError("No LLM API key configured. Set LLM_API_KEY or OPENAI_API_KEY environment variable.")
 
     ssl_verify = os.getenv("SSL_VERIFY", "true").lower() != "false"
 
@@ -305,8 +312,20 @@ Return a JSON object with key "elements" containing the full array."""
             # Only use LLM result if it found more elements than we started with
             if len(result) >= len(elements):
                 return result
-            return elements
+            raise ValueError(
+                f"LLM enhancement returned fewer elements ({len(result)}) than input ({len(elements)}). "
+                f"The LLM may have dropped elements during processing."
+            )
 
+    except httpx.TimeoutException:
+        raise ValueError("LLM enhancement request timed out after 90 seconds.")
+    except httpx.ConnectError as e:
+        raise ConnectionError(f"Cannot connect to LLM API at {api_base}: {e}")
+    except httpx.HTTPStatusError as e:
+        raise ValueError(f"LLM API returned HTTP {e.response.status_code}: {e.response.text[:300]}")
+    except json.JSONDecodeError as e:
+        raise ValueError(f"LLM returned invalid JSON during enhancement: {e}")
+    except (ValueError, ConnectionError):
+        raise
     except Exception as e:
-        print(f"LLM enhancement failed: {e}")
-        return elements
+        raise RuntimeError(f"LLM enhancement failed: {type(e).__name__}: {e}")
