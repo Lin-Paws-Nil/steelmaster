@@ -260,6 +260,541 @@ def extract_and_parse_pdf(filepath: str) -> ExtractionResult:
     )
 
 
+# ===== Hybrid OCR + Spatial Pipeline =====
+
+class _EntityType:
+    BEAM_LABEL = "beam_label"
+    BAR_SPEC = "bar_spec"
+    STIRRUP_SPEC = "stirrup_spec"
+    SPACING = "spacing"
+    DIMENSION = "dimension"
+    OTHER = "other"
+
+
+def classify_text_entities(text_blocks: list[dict]) -> list[dict]:
+    """
+    Parse all text blocks into typed structural entities with coordinates.
+    Each entity gets: type, parsed data, and bounding box coordinates.
+    """
+    entities = []
+
+    for block in text_blocks:
+        text = block["text"].strip()
+        if not text:
+            continue
+
+        entity = {
+            "text": text,
+            "x0": block["x0"],
+            "y0": block["y0"],
+            "x1": block["x1"],
+            "y1": block["y1"],
+            "cx": (block["x0"] + block["x1"]) / 2,
+            "cy": (block["y0"] + block["y1"]) / 2,
+            "page": block["page"],
+        }
+
+        beam = StructuralNotationParser.parse_beam_label(text)
+        if beam:
+            entity["type"] = _EntityType.BEAM_LABEL
+            entity["data"] = beam
+            entities.append(entity)
+            continue
+
+        stirrup = StructuralNotationParser.parse_stirrup(text)
+        if stirrup:
+            entity["type"] = _EntityType.STIRRUP_SPEC
+            entity["data"] = stirrup
+            entities.append(entity)
+            continue
+
+        bar = StructuralNotationParser.parse_bar_spec(text)
+        if bar:
+            entity["type"] = _EntityType.BAR_SPEC
+            entity["data"] = bar
+            entities.append(entity)
+            continue
+
+        spacing = StructuralNotationParser.parse_spacing(text)
+        if spacing is not None:
+            entity["type"] = _EntityType.SPACING
+            entity["data"] = {"spacing": spacing}
+            entities.append(entity)
+            continue
+
+        dim = StructuralNotationParser.parse_dimensions(text)
+        if dim:
+            entity["type"] = _EntityType.DIMENSION
+            entity["data"] = dim
+            entities.append(entity)
+            continue
+
+        if re.match(r"^\d{3,5}$", text):
+            entity["type"] = _EntityType.DIMENSION
+            entity["data"] = {"value_mm": int(text)}
+            entities.append(entity)
+            continue
+
+        entity["type"] = _EntityType.OTHER
+        entity["data"] = None
+        entities.append(entity)
+
+    return entities
+
+
+def assign_entities_to_beams(entities: list[dict]) -> dict[str, dict]:
+    """
+    Group entities by nearest beam using spatial proximity on the same page.
+    Returns: {beam_id: {"beam": beam_data, "bars": [...], "stirrups": [...],
+              "spacings": [...], "dimensions": [...], "all_entities": [...]}}
+    """
+    import math
+
+    beam_entities = [e for e in entities if e["type"] == _EntityType.BEAM_LABEL]
+    non_beam_entities = [e for e in entities if e["type"] != _EntityType.BEAM_LABEL and e["type"] != _EntityType.OTHER]
+
+    if not beam_entities:
+        return {}
+
+    beam_groups: dict[str, dict] = {}
+    for be in beam_entities:
+        bid = be["data"]["beam_id"]
+        beam_groups[bid] = {
+            "beam": be,
+            "bars": [],
+            "stirrups": [],
+            "spacings": [],
+            "dimensions": [],
+            "all_entities": [],
+        }
+
+    for entity in non_beam_entities:
+        best_beam = None
+        best_dist = float("inf")
+
+        for be in beam_entities:
+            if be["page"] != entity["page"]:
+                continue
+            dist = math.hypot(entity["cx"] - be["cx"], entity["cy"] - be["cy"])
+            if dist < best_dist:
+                best_dist = dist
+                best_beam = be["data"]["beam_id"]
+
+        if best_beam is None:
+            continue
+
+        group = beam_groups[best_beam]
+        group["all_entities"].append(entity)
+
+        if entity["type"] == _EntityType.BAR_SPEC:
+            group["bars"].append(entity)
+        elif entity["type"] == _EntityType.STIRRUP_SPEC:
+            group["stirrups"].append(entity)
+        elif entity["type"] == _EntityType.SPACING:
+            group["spacings"].append(entity)
+        elif entity["type"] == _EntityType.DIMENSION:
+            group["dimensions"].append(entity)
+
+    return beam_groups
+
+
+def _determine_bar_position(bar_entity: dict, beam_entity: dict, all_bars: list[dict]) -> str:
+    """
+    Determine if a bar is 'top' or 'bottom' based on Y-coordinate
+    relative to the beam label position.
+
+    In PDF coordinates, Y increases downward. Beam labels are typically
+    placed below the beam drawing. Bars above (smaller Y) the beam label = top,
+    bars below or at same level (larger Y) = bottom.
+
+    Refined: use the midpoint of all bar Y-positions as the beam center.
+    """
+    if not all_bars:
+        return "bottom"
+
+    all_ys = [b["cy"] for b in all_bars]
+    y_center = (min(all_ys) + max(all_ys)) / 2
+
+    if bar_entity["cy"] < y_center:
+        return "top"
+    return "bottom"
+
+
+def _determine_bar_zone(bar_entity: dict, beam_entity: dict, dimensions: list[dict], all_bars: list[dict]) -> str:
+    """
+    Determine if a bar is 'full' (straight, full span) or 'partial' (extra).
+
+    Heuristics (in order of priority):
+    1. If there's a dimension annotation nearby that looks like a bar cut length
+       (value between 800-3000mm, not matching beam width/depth), mark as partial.
+    2. Default to 'full' (straight bar).
+    """
+    import math
+
+    nearby_dim_threshold = 100
+    beam_width = beam_entity["data"]["width"]
+    beam_depth = beam_entity["data"]["depth"]
+
+    for dim in dimensions:
+        data = dim.get("data", {})
+        if "value_mm" in data:
+            val = data["value_mm"]
+            # Skip dimensions that match beam cross-section dimensions
+            if val == beam_width or val == beam_depth:
+                continue
+            # Bar cut lengths are typically 800-4000mm
+            if val < 800 or val > 5000:
+                continue
+            dist = math.hypot(bar_entity["cx"] - dim["cx"], bar_entity["cy"] - dim["cy"])
+            if dist < nearby_dim_threshold:
+                return "partial"
+
+    return "full"
+
+
+def _determine_bar_subzone(bar_entity: dict, all_bars: list[dict]) -> str:
+    """
+    For partial (extra) bars, determine if they're 'mid-span' or 'support' extra.
+    Bars in the center half of the beam X-extent = mid-span extra.
+    Bars in the outer quarters = support extra.
+    """
+    if not all_bars:
+        return "mid-span"
+
+    all_xs = [b["cx"] for b in all_bars]
+    x_min, x_max = min(all_xs), max(all_xs)
+    x_range = x_max - x_min
+
+    if x_range == 0:
+        return "mid-span"
+
+    relative_x = (bar_entity["cx"] - x_min) / x_range
+    if 0.3 < relative_x < 0.7:
+        return "mid-span"
+    return "both-supports"
+
+
+def _determine_stirrup_zone(stirrup_entity: dict, beam_entity: dict, all_stirrups: list[dict]) -> str:
+    """
+    Determine stirrup zone: 'end', 'support', or 'mid' based on X-position.
+
+    Strategy: sort all stirrup/spacing annotations by X-position.
+    - Leftmost and rightmost = end zones (lighter stirrups at beam extremes)
+    - Next inward = support zones (heavier, closer spacing near columns)
+    - Center = mid zone (wider spacing)
+
+    If only 2 annotations, the one with smaller spacing = support, larger = mid.
+    If only 1, treat as uniform (mid).
+    """
+    if len(all_stirrups) <= 1:
+        return "mid"
+
+    sorted_stirrups = sorted(all_stirrups, key=lambda s: s["cx"])
+
+    idx = sorted_stirrups.index(stirrup_entity) if stirrup_entity in sorted_stirrups else -1
+    if idx == -1:
+        dists = [abs(stirrup_entity["cx"] - s["cx"]) for s in sorted_stirrups]
+        idx = dists.index(min(dists))
+
+    n = len(sorted_stirrups)
+
+    if n == 2:
+        if idx == 0:
+            return "support"
+        return "mid"
+
+    if n == 3:
+        if idx == 0:
+            return "end"
+        elif idx == 1:
+            return "support"
+        else:
+            return "mid"
+
+    if n >= 4:
+        if idx == 0 or idx == n - 1:
+            return "end"
+        elif idx == 1 or idx == n - 2:
+            return "support"
+        else:
+            return "mid"
+
+    return "mid"
+
+
+def build_elements_from_spatial(beam_groups: dict[str, dict]) -> list[StructuralElement]:
+    """
+    Assemble StructuralElement objects with BeamReinforcementDetail
+    from spatially-classified entities.
+    """
+    from backend.app.models.schemas import BeamReinforcementDetail, RebarLayer
+
+    elements = []
+
+    for bid, group in beam_groups.items():
+        beam_data = group["beam"]["data"]
+        beam_entity = group["beam"]
+        bars = group["bars"]
+        stirrups = group["stirrups"]
+        spacings = group["spacings"]
+        dimensions = group["dimensions"]
+
+        width = float(beam_data["width"])
+        depth = float(beam_data["depth"])
+
+        # Classify bars into top/bottom
+        top_bars = []
+        bottom_bars = []
+        for bar in bars:
+            pos = _determine_bar_position(bar, beam_entity, bars)
+            if pos == "top":
+                top_bars.append(bar)
+            else:
+                bottom_bars.append(bar)
+
+        # Within top/bottom, classify straight vs extra
+        # Heuristic: if multiple bars at same position, larger dia = straight, smaller = extra
+        bottom_straight_layers = []
+        bottom_extra_layers = []
+        top_straight_layers = []
+        top_extra_layers = []
+
+        for bar in bottom_bars:
+            zone = _determine_bar_zone(bar, beam_entity, dimensions, bars)
+            layer = RebarLayer(
+                diameter=float(bar["data"]["diameter"]),
+                count=int(bar["data"]["count"]),
+                position="bottom",
+                zone="full",
+            )
+            if zone == "partial":
+                subzone = _determine_bar_subzone(bar, bars)
+                layer.zone = subzone
+                bottom_extra_layers.append(layer)
+            else:
+                bottom_straight_layers.append(layer)
+
+        # If all bottom bars are "straight" but have different diameters, 
+        # the smaller diameter is likely the extra bar
+        if len(bottom_straight_layers) > 1:
+            bottom_straight_layers.sort(key=lambda l: l.diameter, reverse=True)
+            kept = [bottom_straight_layers[0]]
+            for layer in bottom_straight_layers[1:]:
+                if layer.diameter < kept[0].diameter:
+                    layer.zone = "mid-span"
+                    bottom_extra_layers.append(layer)
+                else:
+                    kept.append(layer)
+            bottom_straight_layers = kept
+
+        for bar in top_bars:
+            zone = _determine_bar_zone(bar, beam_entity, dimensions, bars)
+            layer = RebarLayer(
+                diameter=float(bar["data"]["diameter"]),
+                count=int(bar["data"]["count"]),
+                position="top",
+                zone="full",
+            )
+            if zone == "partial":
+                subzone = _determine_bar_subzone(bar, bars)
+                layer.zone = subzone
+                top_extra_layers.append(layer)
+            else:
+                top_straight_layers.append(layer)
+
+        # If all top bars are "straight" but have different diameters,
+        # the larger diameter is likely the extra at support, smaller is straight
+        if len(top_straight_layers) > 1:
+            top_straight_layers.sort(key=lambda l: l.diameter)
+            kept = [top_straight_layers[0]]
+            for layer in top_straight_layers[1:]:
+                if layer.diameter > kept[0].diameter:
+                    layer.zone = "both-supports"
+                    top_extra_layers.append(layer)
+                else:
+                    kept.append(layer)
+            top_straight_layers = kept
+
+        # Classify stirrups into zones
+        # Combine stirrups and spacings into a unified list sorted by X-position
+        stirrup_end_zone = None
+        stirrup_support_zone = None
+        stirrup_mid_zone = None
+
+        all_stirrup_like = stirrups + spacings
+        all_stirrup_like_sorted = sorted(all_stirrup_like, key=lambda s: s["cx"])
+
+        for i, item in enumerate(all_stirrup_like_sorted):
+            zone = _determine_stirrup_zone(item, beam_entity, all_stirrup_like_sorted)
+
+            if item["type"] == _EntityType.STIRRUP_SPEC:
+                sz_data = {
+                    "dia": item["data"]["diameter"],
+                    "spacing": item["data"]["spacing"],
+                    "legs": item["data"].get("legs", 2),
+                }
+            elif item["type"] == _EntityType.SPACING:
+                # For standalone spacing, inherit diameter from nearest full stirrup
+                base_stirrup = None
+                if stirrups:
+                    import math
+                    min_d = float("inf")
+                    for st in stirrups:
+                        d = math.hypot(item["cx"] - st["cx"], item["cy"] - st["cy"])
+                        if d < min_d:
+                            min_d = d
+                            base_stirrup = st
+                sz_data = {
+                    "dia": base_stirrup["data"]["diameter"] if base_stirrup else 8,
+                    "spacing": item["data"]["spacing"],
+                    "legs": base_stirrup["data"].get("legs", 2) if base_stirrup else 2,
+                }
+            else:
+                continue
+
+            if zone == "end" and stirrup_end_zone is None:
+                stirrup_end_zone = sz_data
+            elif zone == "support" and stirrup_support_zone is None:
+                stirrup_support_zone = sz_data
+            elif zone == "mid" and stirrup_mid_zone is None:
+                stirrup_mid_zone = sz_data
+            elif stirrup_mid_zone is None:
+                stirrup_mid_zone = sz_data
+
+        # Estimate span from dimension annotations if available
+        span = None
+        for dim in dimensions:
+            data = dim.get("data", {})
+            if "value_mm" in data and data["value_mm"] > 1500:
+                if span is None or data["value_mm"] > span:
+                    span = data["value_mm"]
+            elif data.get("length"):
+                span = data["length"]
+
+        # Calculate zone lengths based on span
+        if span and stirrup_end_zone:
+            stirrup_end_zone["zone_length_mm"] = span * 0.1
+        if span and stirrup_support_zone:
+            stirrup_support_zone["zone_length_mm"] = span * 0.25
+        if span and stirrup_mid_zone:
+            stirrup_mid_zone["zone_length_mm"] = span * 0.5
+
+        # Build the detail object
+        reinf_detail = BeamReinforcementDetail(
+            bottom_straight=bottom_straight_layers or None,
+            bottom_extra_midspan=bottom_extra_layers or None,
+            top_straight=top_straight_layers or None,
+            top_extra_support=top_extra_layers or None,
+            side_face=None,
+            stirrup_end_zone=stirrup_end_zone,
+            stirrup_support_zone=stirrup_support_zone,
+            stirrup_mid_zone=stirrup_mid_zone,
+        )
+
+        # Top-level fields for backward compatibility
+        primary_bottom = bottom_straight_layers[0] if bottom_straight_layers else None
+        primary_top = top_straight_layers[0] if top_straight_layers else (top_extra_layers[0] if top_extra_layers else None)
+        primary_stirrup = stirrup_support_zone or stirrup_mid_zone or stirrup_end_zone
+
+        element = StructuralElement(
+            element_type=ElementType.BEAM,
+            label=bid,
+            width=width,
+            depth=depth,
+            length=float(span) if span else 6000.0,
+            bottom_bar_dia=primary_bottom.diameter if primary_bottom else None,
+            bottom_bar_count=primary_bottom.count if primary_bottom else None,
+            top_bar_dia=primary_top.diameter if primary_top else None,
+            top_bar_count=primary_top.count if primary_top else None,
+            stirrup_dia=float(primary_stirrup["dia"]) if primary_stirrup else None,
+            stirrup_spacing=float(primary_stirrup["spacing"]) if primary_stirrup else None,
+            quantity=1,
+            reinforcement_detail=reinf_detail,
+        )
+        elements.append(element)
+
+    return elements
+
+
+async def analyze_pdf_hybrid(
+    filepath: str,
+    filename: str,
+    api_key: Optional[str] = None,
+    api_base: Optional[str] = None,
+    model: Optional[str] = None,
+) -> list[StructuralElement]:
+    """
+    Hybrid extraction: OCR for text reading, spatial logic for assignment,
+    LLM only for span length estimation when not available from text.
+
+    Returns empty list if no beam labels are found (caller should fall back
+    to full LLM vision for raster/scanned PDFs).
+    """
+    text_blocks = extract_text_blocks(filepath)
+
+    entities = classify_text_entities(text_blocks)
+
+    beam_groups = assign_entities_to_beams(entities)
+
+    if not beam_groups:
+        return []
+
+    elements = build_elements_from_spatial(beam_groups)
+
+    # Optional: use LLM to estimate span lengths for beams missing length data
+    beams_missing_span = [e for e in elements if e.length == 6000.0]
+    if beams_missing_span and api_key:
+        import httpx
+        from openai import AsyncOpenAI
+
+        api_base_url = api_base or os.getenv("LLM_API_BASE", "https://api.openai.com/v1")
+        model_name = model or os.getenv("LLM_MODEL", "gpt-4o")
+        ssl_verify = os.getenv("SSL_VERIFY", "true").lower() != "false"
+
+        try:
+            http_client = httpx.AsyncClient(verify=ssl_verify)
+            client = AsyncOpenAI(
+                api_key=api_key,
+                base_url=api_base_url,
+                http_client=http_client,
+            )
+
+            pages = render_pdf_pages(filepath, dpi=150)
+            if pages:
+                img_bytes = pages[0][0]
+                img_base64 = image_to_base64(img_bytes)
+                beam_labels = [e.label for e in beams_missing_span]
+
+                resp = await client.chat.completions.create(
+                    model=model_name,
+                    messages=[
+                        {"role": "system", "content": "You read structural drawings and provide beam span lengths in mm."},
+                        {"role": "user", "content": [
+                            {"type": "text", "text": (
+                                f"Read the span/length for these beams from the dimension lines in this drawing: {', '.join(beam_labels)}.\n"
+                                f"Return JSON: {{\"spans\": {{\"B1\": 5000, \"B2\": 6000, ...}}}}\n"
+                                f"Only include beams where you can clearly read the span. Values in mm."
+                            )},
+                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_base64}", "detail": "low"}},
+                        ]},
+                    ],
+                    temperature=0.1,
+                    max_tokens=1024,
+                )
+                content = resp.choices[0].message.content
+                spans_data = _parse_json_response(content)
+                spans = spans_data.get("spans", {})
+
+                for elem in elements:
+                    if elem.label in spans:
+                        elem.length = float(spans[elem.label])
+        except Exception as e:
+            print(f"LLM span estimation failed (non-critical): {e}")
+
+    print(f"Hybrid OCR pipeline: found {len(elements)} beams with reinforcement")
+    return elements
+
+
 def render_pdf_pages(filepath: str, dpi: int = 200) -> list[tuple[bytes, str]]:
     """
     Render each page of a PDF as a high-resolution image.

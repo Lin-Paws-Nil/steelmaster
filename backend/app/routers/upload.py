@@ -7,7 +7,8 @@ from fastapi import APIRouter, UploadFile, File, HTTPException
 
 from backend.app.services.dwg_service import parse_file, extract_and_parse
 from backend.app.services.pdf_service import (
-    parse_pdf_file, render_pdf_pages, analyze_pdf_with_vision, extract_and_parse_pdf,
+    parse_pdf_file, render_pdf_pages, analyze_pdf_with_vision,
+    analyze_pdf_hybrid, extract_and_parse_pdf,
 )
 from backend.app.models.schemas import DWGParseResult, ExtractionResult
 
@@ -99,29 +100,46 @@ async def upload_and_estimate(file: UploadFile = File(...), use_llm: bool = Fals
     elements = parse_result.elements_detected
     parse_method = parse_result.metadata.get("parse_method", "")
 
-    # For PDF files, always use vision LLM to analyze the drawing images
+    # For PDF files: try hybrid OCR pipeline first, fall back to LLM vision
     if ext == ".pdf":
         if use_llm or not elements:
+            import os
+            api_key = os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
+
+            # Step 1: Try hybrid OCR + spatial logic (fast, deterministic)
             try:
-                pages = render_pdf_pages(str(save_path), dpi=250)
-                vision_elements = await analyze_pdf_with_vision(
-                    pages, file.filename or "drawing.pdf"
+                hybrid_elements = await analyze_pdf_hybrid(
+                    str(save_path), file.filename or "drawing.pdf",
+                    api_key=api_key,
                 )
-                if vision_elements:
-                    elements = vision_elements
-                else:
-                    raise HTTPException(
-                        status_code=422,
-                        detail="Vision API returned no structural elements from the PDF. The drawing may not contain recognizable structural annotations."
-                    )
-            except HTTPException:
-                raise
-            except ValueError as e:
-                raise HTTPException(status_code=422, detail=f"PDF vision analysis failed: {str(e)}")
-            except ConnectionError as e:
-                raise HTTPException(status_code=503, detail=f"Cannot reach LLM service: {str(e)}")
+                if hybrid_elements:
+                    elements = hybrid_elements
             except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Unexpected error during PDF vision analysis: {type(e).__name__}: {str(e)}")
+                print(f"Hybrid OCR pipeline failed (will try LLM vision): {e}")
+                hybrid_elements = []
+
+            # Step 2: If hybrid found nothing (raster PDF or no beam labels), use LLM vision
+            if not elements:
+                try:
+                    pages = render_pdf_pages(str(save_path), dpi=250)
+                    vision_elements = await analyze_pdf_with_vision(
+                        pages, file.filename or "drawing.pdf"
+                    )
+                    if vision_elements:
+                        elements = vision_elements
+                    else:
+                        raise HTTPException(
+                            status_code=422,
+                            detail="No structural elements detected. Neither OCR nor Vision API could extract beam data from this PDF."
+                        )
+                except HTTPException:
+                    raise
+                except ValueError as e:
+                    raise HTTPException(status_code=422, detail=f"PDF analysis failed: {str(e)}")
+                except ConnectionError as e:
+                    raise HTTPException(status_code=503, detail=f"Cannot reach LLM service: {str(e)}")
+                except Exception as e:
+                    raise HTTPException(status_code=500, detail=f"Unexpected error during PDF analysis: {type(e).__name__}: {str(e)}")
 
     # For DWG/DXF files: use LLM only when fallback method was used or explicitly requested
     elif parse_method == "binary_fallback":
