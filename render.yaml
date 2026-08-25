@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: steel-estimator
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: LLM_API_KEY
+        sync: false  # You'll set this manually in Render dashboard
+      - key: LLM_API_BASE
+        value: https://api.openai.com/v1
+      - key: LLM_MODEL
+        value: gpt-4o
+      - key: SSL_VERIFY
+        value: "true"

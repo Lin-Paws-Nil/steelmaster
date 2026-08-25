@@ -1,0 +1,17 @@
+/Users/swapnild/Documents/Steel Estimator/tools/dwg-reader/bin/Release/net8.0/dwg-reader
+/Users/swapnild/Documents/Steel Estimator/tools/dwg-reader/bin/Release/net8.0/dwg-reader.deps.json
+/Users/swapnild/Documents/Steel Estimator/tools/dwg-reader/bin/Release/net8.0/dwg-reader.runtimeconfig.json
+/Users/swapnild/Documents/Steel Estimator/tools/dwg-reader/bin/Release/net8.0/dwg-reader.dll
+/Users/swapnild/Documents/Steel Estimator/tools/dwg-reader/bin/Release/net8.0/dwg-reader.pdb
+/Users/swapnild/Documents/Steel Estimator/tools/dwg-reader/bin/Release/net8.0/ACadSharp.dll
+/Users/swapnild/Documents/Steel Estimator/tools/dwg-reader/obj/Release/net8.0/dwg-reader.csproj.AssemblyReference.cache
+/Users/swapnild/Documents/Steel Estimator/tools/dwg-reader/obj/Release/net8.0/dwg-reader.GeneratedMSBuildEditorConfig.editorconfig
+/Users/swapnild/Documents/Steel Estimator/tools/dwg-reader/obj/Release/net8.0/dwg-reader.AssemblyInfoInputs.cache
+/Users/swapnild/Documents/Steel Estimator/tools/dwg-reader/obj/Release/net8.0/dwg-reader.AssemblyInfo.cs
+/Users/swapnild/Documents/Steel Estimator/tools/dwg-reader/obj/Release/net8.0/dwg-reader.csproj.CoreCompileInputs.cache
+/Users/swapnild/Documents/Steel Estimator/tools/dwg-reader/obj/Release/net8.0/dwg-reader.csproj.Up2Date
+/Users/swapnild/Documents/Steel Estimator/tools/dwg-reader/obj/Release/net8.0/dwg-reader.dll
+/Users/swapnild/Documents/Steel Estimator/tools/dwg-reader/obj/Release/net8.0/refint/dwg-reader.dll
+/Users/swapnild/Documents/Steel Estimator/tools/dwg-reader/obj/Release/net8.0/dwg-reader.pdb
+/Users/swapnild/Documents/Steel Estimator/tools/dwg-reader/obj/Release/net8.0/dwg-reader.genruntimeconfig.cache
+/Users/swapnild/Documents/Steel Estimator/tools/dwg-reader/obj/Release/net8.0/ref/dwg-reader.dll

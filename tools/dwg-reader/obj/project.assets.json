@@ -1,0 +1,118 @@
+{
+  "version": 3,
+  "targets": {
+    "net8.0": {
+      "ACadSharp/3.7.1": {
+        "type": "package",
+        "compile": {
+          "lib/net8.0/ACadSharp.dll": {
+            "related": ".xml"
+          }
+        },
+        "runtime": {
+          "lib/net8.0/ACadSharp.dll": {
+            "related": ".xml"
+          }
+        }
+      }
+    }
+  },
+  "libraries": {
+    "ACadSharp/3.7.1": {
+      "sha512": "+feXWAswHouS4ev2YAKa/oh/94dwtcI5AZ3Gb6UfpcYzYViCYUEGdqGw8NZYEk9q7kAHtbQmNbgGLxqi+q7U7A==",
+      "type": "package",
+      "path": "acadsharp/3.7.1",
+      "files": [
+        ".nupkg.metadata",
+        ".signature.p7s",
+        "README.md",
+        "acadsharp.3.7.1.nupkg.sha512",
+        "acadsharp.nuspec",
+        "lib/net10.0/ACadSharp.dll",
+        "lib/net10.0/ACadSharp.xml",
+        "lib/net48/ACadSharp.dll",
+        "lib/net48/ACadSharp.xml",
+        "lib/net8.0/ACadSharp.dll",
+        "lib/net8.0/ACadSharp.xml",
+        "lib/net9.0/ACadSharp.dll",
+        "lib/net9.0/ACadSharp.xml",
+        "lib/netstandard2.0/ACadSharp.dll",
+        "lib/netstandard2.0/ACadSharp.xml",
+        "lib/netstandard2.1/ACadSharp.dll",
+        "lib/netstandard2.1/ACadSharp.xml"
+      ]
+    }
+  },
+  "projectFileDependencyGroups": {
+    "net8.0": [
+      "ACadSharp >= 3.7.1"
+    ]
+  },
+  "packageFolders": {
+    "/Users/swapnild/Documents/Steel Estimator/tools/.dotnet-cli/.nuget/packages/": {}
+  },
+  "project": {
+    "version": "1.0.0",
+    "restore": {
+      "projectUniqueName": "/Users/swapnild/Documents/Steel Estimator/tools/dwg-reader/dwg-reader.csproj",
+      "projectName": "dwg-reader",
+      "projectPath": "/Users/swapnild/Documents/Steel Estimator/tools/dwg-reader/dwg-reader.csproj",
+      "packagesPath": "/Users/swapnild/Documents/Steel Estimator/tools/.dotnet-cli/.nuget/packages/",
+      "outputPath": "/Users/swapnild/Documents/Steel Estimator/tools/dwg-reader/obj/",
+      "projectStyle": "PackageReference",
+      "configFilePaths": [
+        "/Users/swapnild/Documents/Steel Estimator/tools/.dotnet-cli/.nuget/NuGet/NuGet.Config"
+      ],
+      "originalTargetFrameworks": [
+        "net8.0"
+      ],
+      "sources": {
+        "https://api.nuget.org/v3/index.json": {}
+      },
+      "frameworks": {
+        "net8.0": {
+          "targetAlias": "net8.0",
+          "projectReferences": {}
+        }
+      },
+      "warningProperties": {
+        "warnAsError": [
+          "NU1605"
+        ]
+      },
+      "restoreAuditProperties": {
+        "enableAudit": "true",
+        "auditLevel": "low",
+        "auditMode": "direct"
+      }
+    },
+    "frameworks": {
+      "net8.0": {
+        "targetAlias": "net8.0",
+        "dependencies": {
+          "ACadSharp": {
+            "target": "Package",
+            "version": "[3.7.1, )"
+          }
+        },
+        "imports": [
+          "net461",
+          "net462",
+          "net47",
+          "net471",
+          "net472",
+          "net48",
+          "net481"
+        ],
+        "assetTargetFallback": true,
+        "warn": true,
+        "frameworkReferences": {
+          "Microsoft.NETCore.App": {
+            "privateAssets": "all"
+          }
+        },
+        "runtimeIdentifierGraphPath": "/Users/swapnild/.dotnet/sdk/8.0.424/PortableRuntimeIdentifierGraph.json"
+      }
+    }
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "dgSpecHash": "Rjh2J1jWXtI=",
+  "success": true,
+  "projectFilePath": "/Users/swapnild/Documents/Steel Estimator/tools/dwg-reader/dwg-reader.csproj",
+  "expectedPackageFiles": [
+    "/Users/swapnild/Documents/Steel Estimator/tools/.dotnet-cli/.nuget/packages/acadsharp/3.7.1/acadsharp.3.7.1.nupkg.sha512"
+  ],
+  "logs": []
+}

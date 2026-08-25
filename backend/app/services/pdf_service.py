@@ -1,0 +1,821 @@
+"""
+PDF Structural Drawing Service
+
+Provides two levels of extraction:
+1. Raw text block extraction with bounding box coordinates (extract_text_blocks)
+2. Full structural element parsing with LLM vision (parse_pdf_file, analyze_pdf_with_vision)
+
+Processes PDF files containing structural drawings by:
+1. Rendering pages as high-resolution images
+2. Extracting embedded text (dimensions, annotations)
+3. Sending to vision-capable LLM for structural interpretation
+4. Analyzing line weights/darkness to differentiate element types
+
+Line weight conventions in structural drawings:
+- Thick/dark lines: Structural members in section (columns, beams)
+- Medium lines: Outlines, elevation views
+- Thin/light lines: Dimension lines, center lines, grid lines
+- Dashed lines: Hidden elements, below-slab beams
+"""
+
+import base64
+import io
+import json
+import os
+import re
+from pathlib import Path
+from typing import Optional
+
+import pymupdf
+from PIL import Image, ImageFilter, ImageEnhance
+
+from backend.app.models.schemas import (
+    DWGParseResult,
+    StructuralElement,
+    ElementType,
+    TextEntity,
+    BeamDetail,
+    BeamDimensions,
+    BeamReinforcement,
+    ExtractionResult,
+)
+from backend.app.utils.parser import StructuralNotationParser
+
+
+VISION_SYSTEM_PROMPT = """You are an expert structural engineer analyzing a structural drawing (plan/section/detail) from a PDF.
+
+Your task is to identify EVERY structural element visible in this drawing and provide their specifications.
+
+CRITICAL - INDIAN REINFORCEMENT NOTATION:
+- "2K25" or "2-K25" or "2#25" = 2 bars of 25mm diameter (count=2, dia=25)
+- "4K16" = 4 bars of 16mm diameter (count=4, dia=16)
+- "K10@150C/C" or "K10@150c/c" = stirrups of 10mm diameter at 150mm spacing (stirrup_dia=10, stirrup_spacing=150)
+- "K8@200C/C" = stirrups of 8mm diameter at 200mm spacing (stirrup_dia=8, stirrup_spacing=200)
+- "@200C/C" or "@150C/C" = spacing between stirrups in mm
+- "B1(230X600)" = Beam B1 with width=230mm, depth=600mm
+- The number AFTER "K" is the bar diameter in mm
+- The number BEFORE "K" is the count of bars
+
+READING THE DRAWING:
+- Thicker/darker lines represent structural members (columns shown as filled/hatched rectangles, beams as thick lines)
+- Dimension lines show sizes in mm (e.g., 300x450 means 300mm wide x 450mm deep)
+- Beam labels like "B1(230X600)" give the EXACT width and depth - use these values directly
+- Grid lines (thin, with circle labels) show column positions
+- TOP bars are shown above the beam centerline (usually at supports/ends)
+- BOTTOM bars are shown below the beam centerline (usually at mid-span, these are the main tension bars)
+- A beam section drawing will show top and bottom bars separately
+
+WHAT TO IDENTIFY:
+1. ALL columns (look for grid intersections, hatched rectangles)
+2. ALL beams - read the EXACT dimensions from labels like B1(230X600)
+3. For each beam: identify top bars AND bottom bars SEPARATELY with their count and diameter
+4. ALL slab panels (rectangular areas bounded by beams)
+5. Footings (if shown - usually in foundation plan)
+6. Staircases (if shown)
+7. Lintels (over openings)
+
+Output a JSON object with key "elements". Each element:
+{
+  "element_type": "column|beam|slab|footing|staircase|lintel|wall",
+  "label": "B1 (230x600)",
+  "width": number_in_mm (e.g. 230),
+  "depth": number_in_mm (e.g. 600),
+  "length": number_in_mm (beam span from dimensions, use 4000-6000 if not clearly visible),
+  "bottom_bar_dia": number_in_mm (e.g. 25 for 2K25),
+  "bottom_bar_count": number (e.g. 2 for 2K25),
+  "top_bar_dia": number_in_mm (e.g. 16 for 2K16),
+  "top_bar_count": number (e.g. 2 for 2K16),
+  "stirrup_dia": number_in_mm (e.g. 10 for K10@150C/C),
+  "stirrup_spacing": number_in_mm (e.g. 150 for K10@150C/C),
+  "quantity": number
+}
+
+For columns, use main_bar_dia and main_bar_count instead of top/bottom.
+
+CRITICAL RULES:
+- Read beam dimensions EXACTLY from the label, e.g. B1(230X600) means width=230, depth=600
+- "2K25" means count=2, diameter=25. Do NOT confuse these.
+- Report top and bottom bars SEPARATELY - they often have different diameters
+- Stirrup diameter comes from the notation like K10 (dia=10) or K8 (dia=8)
+- Beams with letter suffixes like B3A, B5B, B12C are SEPARATE beams - include them all with their exact label
+- A drawing may have B1 through B20 or more - list EVERY SINGLE ONE you can see
+- If a beam is partially visible at the edge of the drawing, still include it
+- Be THOROUGH - list every element you can identify. Missing beams is the worst error you can make."""
+
+
+# ===== New extraction API =====
+
+def extract_text_blocks(filepath: str) -> list[dict]:
+    """
+    Open a vector PDF, extract all text blocks with precise bounding box
+    coordinates (X0, Y0, X1, Y1) and page number.
+
+    Returns a list of dicts:
+        [{"text": "2K16", "x0": 100.5, "y0": 200.3, "x1": 150.2, "y1": 220.1, "page": 0}, ...]
+    """
+    doc = pymupdf.open(filepath)
+    blocks = []
+
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        text_dict = page.get_text("dict")
+
+        for block in text_dict.get("blocks", []):
+            if block.get("type") != 0:  # type 0 = text block
+                continue
+
+            for line in block.get("lines", []):
+                line_text = ""
+                for span in line.get("spans", []):
+                    line_text += span.get("text", "")
+
+                line_text = line_text.strip()
+                if not line_text:
+                    continue
+
+                bbox = line.get("bbox", block.get("bbox", (0, 0, 0, 0)))
+                blocks.append({
+                    "text": line_text,
+                    "x0": round(bbox[0], 2),
+                    "y0": round(bbox[1], 2),
+                    "x1": round(bbox[2], 2),
+                    "y1": round(bbox[3], 2),
+                    "page": page_num,
+                })
+
+    doc.close()
+    return blocks
+
+
+def extract_and_parse_pdf(filepath: str) -> ExtractionResult:
+    """
+    High-level extraction: get raw text blocks + parsed BeamDetail list.
+    Uses bounding box proximity to assign bar specs to their nearest beam.
+    Used by the /upload/pdf endpoint.
+    """
+    import math
+
+    text_blocks = extract_text_blocks(filepath)
+
+    # First pass: identify beams and collect positioned bar/stirrup entities
+    beam_positions: dict[str, tuple[float, float]] = {}  # beam_id -> (cx, cy)
+    beams: dict[str, BeamDetail] = {}
+    bar_entities: list[tuple[str, float, float]] = []  # (notation, cx, cy)
+    stirrup_entities: list[tuple[str, float, float]] = []  # (notation, cx, cy)
+
+    for block in text_blocks:
+        text = block["text"]
+        cx = (block["x0"] + block["x1"]) / 2
+        cy = (block["y0"] + block["y1"]) / 2
+
+        beam = StructuralNotationParser.parse_beam_label(text)
+        if beam:
+            bid = beam["beam_id"]
+            if bid not in beams:
+                beams[bid] = BeamDetail(
+                    beam_id=bid,
+                    dimensions=BeamDimensions(width=beam["width"], depth=beam["depth"]),
+                    reinforcement=BeamReinforcement(),
+                )
+                beam_positions[bid] = (cx, cy)
+            continue
+
+        specs = StructuralNotationParser.find_all_bar_specs(text)
+        for spec in specs:
+            bar_entities.append((spec, cx, cy))
+
+        stirrup = StructuralNotationParser.parse_stirrup(text)
+        if stirrup:
+            stirrup_entities.append((stirrup["notation"], cx, cy))
+
+    # Second pass: assign each bar/stirrup to nearest beam
+    def find_nearest_beam(x: float, y: float) -> Optional[str]:
+        if not beam_positions:
+            return None
+        min_dist = float("inf")
+        nearest = None
+        for bid, (bx, by) in beam_positions.items():
+            dist = math.hypot(x - bx, y - by)
+            if dist < min_dist:
+                min_dist = dist
+                nearest = bid
+        return nearest
+
+    beam_bars: dict[str, list[str]] = {bid: [] for bid in beams}
+    beam_stirrups: dict[str, str] = {bid: "" for bid in beams}
+
+    for notation, x, y in bar_entities:
+        nearest = find_nearest_beam(x, y)
+        if nearest:
+            beam_bars[nearest].append(notation)
+
+    for notation, x, y in stirrup_entities:
+        nearest = find_nearest_beam(x, y)
+        if nearest:
+            beam_stirrups[nearest] = notation
+
+    # Assign: larger dia bars -> bottom, smaller -> top
+    for bid, beam_detail in beams.items():
+        bars = beam_bars.get(bid, [])
+        stirrup = beam_stirrups.get(bid, "")
+
+        if bars:
+            parsed = [StructuralNotationParser.parse_bar_spec(b) for b in bars]
+            parsed = [p for p in parsed if p]
+            parsed.sort(key=lambda p: p["diameter"], reverse=True)
+
+            mid = max(1, len(parsed) // 2)
+            bottom = [p["notation"] for p in parsed[:mid]]
+            top = [p["notation"] for p in parsed[mid:]]
+
+            beam_detail.reinforcement = BeamReinforcement(
+                top_bars=top or bottom,
+                bottom_bars=bottom,
+                stirrups=stirrup,
+            )
+        elif stirrup:
+            beam_detail.reinforcement = BeamReinforcement(stirrups=stirrup)
+
+    raw_annotations = [b["text"] for b in text_blocks]
+
+    return ExtractionResult(
+        filename=os.path.basename(filepath),
+        text_entities=[
+            TextEntity(
+                text=b["text"],
+                x=b["x0"], y=b["y0"],
+                x0=b["x0"], y0=b["y0"], x1=b["x1"], y1=b["y1"],
+                page=b["page"],
+            )
+            for b in text_blocks
+        ],
+        beams=list(beams.values()),
+        raw_annotations=raw_annotations[:200],
+        metadata={
+            "total_text_blocks": len(text_blocks),
+            "beams_found": len(beams),
+            "bar_specs_found": len(bar_entities),
+            "page_count": len(set(b["page"] for b in text_blocks)) if text_blocks else 0,
+        },
+    )
+
+
+def render_pdf_pages(filepath: str, dpi: int = 200) -> list[tuple[bytes, str]]:
+    """
+    Render each page of a PDF as a high-resolution image.
+    Returns list of (image_bytes_png, extracted_text) tuples.
+    """
+    doc = pymupdf.open(filepath)
+    pages = []
+
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        text = page.get_text("text")
+
+        # Render at high DPI for detail visibility
+        mat = pymupdf.Matrix(dpi / 72, dpi / 72)
+        pix = page.get_pixmap(matrix=mat)
+        img_bytes = pix.tobytes("png")
+        pages.append((img_bytes, text))
+
+    doc.close()
+    return pages
+
+
+def enhance_drawing_image(img_bytes: bytes) -> bytes:
+    """
+    Enhance the drawing image to make line weights more distinguishable.
+    Increases contrast so structural elements (darker lines) stand out.
+    """
+    img = Image.open(io.BytesIO(img_bytes))
+
+    enhancer = ImageEnhance.Contrast(img)
+    enhanced = enhancer.enhance(1.3)
+
+    enhanced = enhanced.filter(ImageFilter.SHARPEN)
+
+    output = io.BytesIO()
+    enhanced.save(output, format="PNG", optimize=True)
+    return output.getvalue()
+
+
+def extract_text_annotations(text: str) -> dict:
+    """Extract structural information from PDF text content."""
+    annotations = {
+        "dimensions": [],
+        "bar_specs": [],
+        "spacings": [],
+        "labels": [],
+        "all_text": [],
+    }
+
+    lines = text.strip().split("\n")
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+
+        annotations["all_text"].append(line)
+
+        # Dimension patterns (e.g., 300x450, 230X600)
+        dim_matches = re.findall(r"(\d{2,4})\s*[xX×]\s*(\d{2,4})", line)
+        for match in dim_matches:
+            annotations["dimensions"].append(f"{match[0]}x{match[1]}")
+
+        # Bar specifications (e.g., 4-16mm, 6#20dia, 4nos 16mm)
+        bar_matches = re.findall(
+            r"(\d{1,2})\s*(?:[-#]|nos\.?\s*)\s*(\d{2,3})\s*(?:mm|dia|φ|Φ|ø)", line
+        )
+        for match in bar_matches:
+            annotations["bar_specs"].append(f"{match[0]}-{match[1]}mm")
+
+        # Spacing patterns
+        spacing_matches = re.findall(r"(?:@|c/c|c\.c\.?)\s*(\d{2,3})", line)
+        for match in spacing_matches:
+            annotations["spacings"].append(f"@{match}")
+
+        # Element labels (B1, C1, F1, S1, etc.)
+        label_matches = re.findall(r"\b([BCFSL]\d{1,2})\b", line)
+        annotations["labels"].extend(label_matches)
+
+    return annotations
+
+
+def image_to_base64(img_bytes: bytes) -> str:
+    """Convert image bytes to base64 string for LLM API."""
+    return base64.b64encode(img_bytes).decode()
+
+
+async def analyze_pdf_with_vision(
+    pages: list[tuple[bytes, str]],
+    filename: str,
+    api_key: Optional[str] = None,
+    api_base: Optional[str] = None,
+    model: Optional[str] = None,
+) -> list[StructuralElement]:
+    """
+    Send PDF page images to a vision-capable LLM for structural analysis.
+    Uses a two-pass approach:
+      Pass 1: Identify ALL beam/element labels and dimensions
+      Pass 2: Get full reinforcement details for each element
+    """
+    import httpx
+    from openai import AsyncOpenAI
+
+    api_key = api_key or os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
+    api_base = api_base or os.getenv("LLM_API_BASE", "https://api.openai.com/v1")
+    model = model or os.getenv("LLM_MODEL", "gpt-4o")
+
+    if not api_key:
+        raise ValueError("No LLM API key configured. Set LLM_API_KEY in your .env file.")
+
+    ssl_verify = os.getenv("SSL_VERIFY", "true").lower() != "false"
+
+    http_client = httpx.AsyncClient(verify=ssl_verify)
+    client = AsyncOpenAI(
+        api_key=api_key,
+        base_url=api_base,
+        http_client=http_client,
+    )
+
+    all_elements = []
+
+    for page_idx, (img_bytes, page_text) in enumerate(pages):
+        enhanced_img = enhance_drawing_image(img_bytes)
+        img_base64 = image_to_base64(enhanced_img)
+        text_info = extract_text_annotations(page_text)
+
+        # --- PASS 1: Find all beam labels and basic info ---
+        pass1_content = [
+            {
+                "type": "text",
+                "text": (
+                    f"Look at this structural drawing (file: {filename}, section {page_idx + 1} of {len(pages)}).\n\n"
+                    f"OCR text (may be incomplete):\n"
+                    f"{chr(10).join(text_info['all_text'][:60]) or 'No OCR text'}\n\n"
+                    f"YOUR TASK: List EVERY beam label with its dimensions from the drawing.\n"
+                    f"Beam labels are written as: B1(230X600), B11(450X600), B3A(230X450) etc.\n"
+                    f"The format is: BeamName(WidthXDepth)\n\n"
+                    f"RULES:\n"
+                    f"- B11(450X600) means label='B11', width=450, depth=600\n"
+                    f"- B3A is a separate beam (letter suffix = added later)\n"
+                    f"- Scan the ENTIRE drawing. There may be 20+ beams.\n"
+                    f"- Include EVERY beam: B1, B2, B3, B3A, B4... B11, B12... B20 etc.\n\n"
+                    f"Return JSON:\n"
+                    f'{{"beams": [{{"label": "B1", "width": 230, "depth": 600}}, '
+                    f'{{"label": "B11", "width": 450, "depth": 600}}, ...]}}'
+                ),
+            },
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/png;base64,{img_base64}",
+                    "detail": "high",
+                },
+            },
+        ]
+
+        pass1_payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": "You are an expert at reading structural engineering drawings. Find ALL element labels."},
+                {"role": "user", "content": pass1_content},
+            ],
+            "temperature": 0.1,
+            "max_tokens": 4096,
+        }
+
+        try:
+            # --- PASS 1 using OpenAI SDK ---
+            resp1 = await client.chat.completions.create(
+                model=model,
+                messages=pass1_payload["messages"],
+                temperature=0.1,
+                max_tokens=4096,
+            )
+            content1 = resp1.choices[0].message.content
+            labels_data = _parse_json_response(content1)
+
+            beam_labels = labels_data.get("beams", [])
+
+            beam_count = len(beam_labels)
+            print(f"Pass 1 found: {beam_count} beams")
+
+            if beam_count == 0:
+                # Fallback: treat the whole response as elements list
+                if isinstance(labels_data, list) or labels_data.get("elements"):
+                    elements_data = labels_data if isinstance(labels_data, list) else labels_data.get("elements", [])
+                    all_elements.extend(_parse_elements_from_data(elements_data, page_idx))
+                    continue
+
+            # --- PASS 2: Get reinforcement details for each beam ---
+            # Build a dimension lookup from Pass 1 (these are authoritative)
+            beam_dims = {}
+            for b in beam_labels:
+                bl = b.get("label", "")
+                if bl:
+                    beam_dims[bl] = (float(b.get("width", 230)), float(b.get("depth", 450)))
+
+            beam_list_str = ", ".join(
+                f"{b.get('label', '?')}({b.get('width', '?')}x{b.get('depth', '?')})"
+                for b in beam_labels
+            )
+
+            pass2_content = [
+                {
+                    "type": "text",
+                    "text": (
+                        f"This drawing has {beam_count} beams: {beam_list_str}\n\n"
+                        f"Now read the COMPLETE REINFORCEMENT SCHEDULE for EACH beam from the drawing.\n\n"
+                        f"CRITICAL NOTATION RULES:\n"
+                        f"- '4K20' = 4 bars of 20mm diameter. Count is the number BEFORE 'K', dia is AFTER 'K'\n"
+                        f"- '2K25' = 2 bars of 25mm. '6K16' = 6 bars of 16mm.\n"
+                        f"- 'K10@130C/C' = stirrup dia=10mm, spacing=130mm\n"
+                        f"- 'K8@200C/C' = stirrup dia=8mm, spacing=200mm\n"
+                        f"- '4L-K10@130C/C' = 4-legged stirrup, dia=10mm, spacing=130mm\n"
+                        f"- Bars shown ABOVE beam centerline = top bars (compression/hogging)\n"
+                        f"- Bars shown BELOW beam centerline = bottom bars (tension/sagging)\n"
+                        f"- Extra bars at supports are shown for partial length (cranked/curtailed)\n"
+                        f"- Stirrup spacing often varies: closer spacing at ends (support zone), wider at mid-span\n\n"
+                        f"FOR EACH BEAM, identify these SEPARATE bar groups:\n"
+                        f"1. BOTTOM STRAIGHT BARS: Full-span tension bars at bottom (e.g., 2K20 straight)\n"
+                        f"2. BOTTOM EXTRA AT MIDSPAN: Additional bars at mid-span only (e.g., 2K16 extra)\n"
+                        f"3. TOP STRAIGHT BARS: Full-span bars at top (e.g., 2K12 holding bars)\n"
+                        f"4. TOP EXTRA AT SUPPORTS: Cranked/curtailed bars at supports for hogging (e.g., 2K20 at L/4)\n"
+                        f"5. STIRRUPS END ZONE: Closer spacing near supports (e.g., K8@100 for L/4 from each end)\n"
+                        f"6. STIRRUPS MID ZONE: Wider spacing at center (e.g., K8@150 for middle half)\n"
+                        f"7. SIDE FACE BARS: If beam depth >= 750mm (e.g., 2K12 on each side face)\n\n"
+                        f"Return JSON:\n"
+                        f'{{"elements": [\n'
+                        f'  {{\n'
+                        f'    "label": "B1",\n'
+                        f'    "length": 5000,\n'
+                        f'    "bottom_bar_dia": 20, "bottom_bar_count": 4,\n'
+                        f'    "top_bar_dia": 16, "top_bar_count": 2,\n'
+                        f'    "stirrup_dia": 8, "stirrup_spacing": 150,\n'
+                        f'    "reinforcement_detail": {{\n'
+                        f'      "bottom_straight": [{{"diameter": 20, "count": 2, "position": "bottom", "zone": "full"}}],\n'
+                        f'      "bottom_extra_midspan": [{{"diameter": 16, "count": 2, "position": "bottom", "zone": "mid-span"}}],\n'
+                        f'      "top_straight": [{{"diameter": 12, "count": 2, "position": "top", "zone": "full"}}],\n'
+                        f'      "top_extra_support": [{{"diameter": 20, "count": 2, "position": "top", "zone": "both-supports"}}],\n'
+                        f'      "stirrup_end_zone": {{"dia": 8, "spacing": 100, "legs": 2, "zone_length_mm": 1250}},\n'
+                        f'      "stirrup_mid_zone": {{"dia": 8, "spacing": 150, "legs": 2, "zone_length_mm": 2500}},\n'
+                        f'      "side_face": null\n'
+                        f'    }}\n'
+                        f'  }},\n'
+                        f'  ...(one entry per beam)...\n]}}\n\n'
+                        f"RULES:\n"
+                        f"- You MUST output ALL {beam_count} beams. Do NOT skip any.\n"
+                        f"- The label must EXACTLY match: {', '.join(b.get('label','') for b in beam_labels)}\n"
+                        f"- Read the span/length from dimension lines if visible (in mm)\n"
+                        f"- If stirrup zones are not separately shown, use the same spacing for both zones\n"
+                        f"- stirrup_end_zone.zone_length_mm = span/4 (approx L/4 from each support)\n"
+                        f"- stirrup_mid_zone.zone_length_mm = span/2 (middle portion)\n"
+                        f"- If you see 'EF' or 'EXTRA' near bar annotations, those are extra/curtailed bars\n"
+                        f"- Include side_face bars only if depth >= 750mm\n"
+                        f"- If reinforcement is not clearly visible for a beam, use reasonable defaults:\n"
+                        f"  bottom 2K16 straight + 2K12 extra, top 2K12, stirrup K8@150\n"
+                        f"- If multiple bar sizes at same position (e.g. 2K25+2K20 at bottom), list them as separate entries in the array"
+                    ),
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/png;base64,{img_base64}",
+                        "detail": "high",
+                    },
+                },
+            ]
+
+            # --- PASS 2 using OpenAI SDK ---
+            resp2 = await client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": VISION_SYSTEM_PROMPT},
+                    {"role": "user", "content": pass2_content},
+                ],
+                temperature=0.1,
+                max_tokens=16384,
+            )
+            content2 = resp2.choices[0].message.content
+            parsed2 = _parse_json_response(content2)
+
+            elements_data = parsed2 if isinstance(parsed2, list) else parsed2.get("elements", [])
+
+            # Build elements, FORCING dimensions from Pass 1
+            page_elements = []
+            for item in elements_data:
+                try:
+                    label = item.get("label", f"Beam {len(page_elements)+1}")
+                    # Use dimensions from Pass 1 (authoritative from the beam label)
+                    if label in beam_dims:
+                        width, depth = beam_dims[label]
+                    else:
+                        width = float(item.get("width", 230))
+                        depth = float(item.get("depth", 450))
+
+                    # Build reinforcement detail if provided
+                    reinf_detail = None
+                    if item.get("reinforcement_detail"):
+                        from backend.app.models.schemas import BeamReinforcementDetail, RebarLayer
+                        rd = item["reinforcement_detail"]
+                        reinf_detail = BeamReinforcementDetail(
+                            bottom_straight=[
+                                RebarLayer(**r) for r in (rd.get("bottom_straight") or [])
+                            ] or None,
+                            bottom_extra_midspan=[
+                                RebarLayer(**r) for r in (rd.get("bottom_extra_midspan") or [])
+                            ] or None,
+                            top_straight=[
+                                RebarLayer(**r) for r in (rd.get("top_straight") or [])
+                            ] or None,
+                            top_extra_support=[
+                                RebarLayer(**r) for r in (rd.get("top_extra_support") or [])
+                            ] or None,
+                            side_face=[
+                                RebarLayer(**r) for r in (rd.get("side_face") or [])
+                            ] or None,
+                            stirrup_end_zone=rd.get("stirrup_end_zone"),
+                            stirrup_mid_zone=rd.get("stirrup_mid_zone"),
+                        )
+
+                    element = StructuralElement(
+                        element_type=ElementType.BEAM,
+                        label=label,
+                        width=width,
+                        depth=depth,
+                        length=float(item.get("length", 4000)),
+                        bottom_bar_dia=float(item["bottom_bar_dia"]) if item.get("bottom_bar_dia") else None,
+                        bottom_bar_count=int(item["bottom_bar_count"]) if item.get("bottom_bar_count") else None,
+                        top_bar_dia=float(item["top_bar_dia"]) if item.get("top_bar_dia") else None,
+                        top_bar_count=int(item["top_bar_count"]) if item.get("top_bar_count") else None,
+                        main_bar_dia=float(item["main_bar_dia"]) if item.get("main_bar_dia") else None,
+                        main_bar_count=int(item["main_bar_count"]) if item.get("main_bar_count") else None,
+                        stirrup_dia=float(item["stirrup_dia"]) if item.get("stirrup_dia") else None,
+                        stirrup_spacing=float(item["stirrup_spacing"]) if item.get("stirrup_spacing") else None,
+                        quantity=int(item.get("quantity", 1)),
+                        reinforcement_detail=reinf_detail,
+                    )
+                    page_elements.append(element)
+                except (ValueError, KeyError) as e:
+                    print(f"Skipping element: {e}")
+                    continue
+
+            all_elements.extend(page_elements)
+            print(f"Pass 2 returned: {len(page_elements)} elements")
+
+            # Add any beams from Pass 1 that Pass 2 missed
+            found_labels = {e.label for e in page_elements}
+            for beam in beam_labels:
+                bl = beam.get("label", "")
+                if bl and bl not in found_labels:
+                    w, d = beam_dims.get(bl, (230, 450))
+                    all_elements.append(StructuralElement(
+                        element_type=ElementType.BEAM,
+                        label=bl,
+                        width=w,
+                        depth=d,
+                        length=4000,
+                        bottom_bar_dia=16,
+                        bottom_bar_count=2,
+                        top_bar_dia=12,
+                        top_bar_count=2,
+                        stirrup_dia=8,
+                        stirrup_spacing=150,
+                        quantity=1,
+                    ))
+
+        except httpx.TimeoutException:
+            raise ValueError(f"LLM API timed out on page {page_idx + 1}. Try again.")
+        except httpx.ConnectError as e:
+            raise ValueError(f"Cannot connect to LLM API at {api_base}: {e}")
+        except httpx.ProxyError as e:
+            raise ValueError(f"Proxy error on page {page_idx + 1}: {e}. Try setting HTTP_PROXY/HTTPS_PROXY or disabling proxy.")
+        except httpx.HTTPStatusError as e:
+            raise ValueError(f"LLM API HTTP error on page {page_idx + 1}: {e.response.status_code} - {e.response.text[:300]}")
+        except ValueError:
+            raise
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            raise ValueError(f"Vision analysis error on page {page_idx + 1}: {type(e).__name__}: {str(e)}")
+
+    return _deduplicate_elements(all_elements)
+
+
+def _parse_json_response(content: str) -> dict:
+    """Parse JSON from LLM response, handling markdown code blocks."""
+    json_str = content
+    if "```json" in content:
+        json_str = content.split("```json")[1].split("```")[0]
+    elif "```" in content:
+        parts = content.split("```")
+        if len(parts) >= 3:
+            json_str = parts[1]
+            if json_str.startswith("\n"):
+                json_str = json_str[1:]
+
+    try:
+        return json.loads(json_str)
+    except json.JSONDecodeError:
+        json_match = re.search(r'\{[\s\S]*\}', content)
+        if json_match:
+            return json.loads(json_match.group())
+        raise ValueError(f"Could not parse JSON from LLM response: {content[:200]}")
+
+
+def _parse_elements_from_data(elements_data: list, page_idx: int) -> list[StructuralElement]:
+    """Parse a list of element dicts into StructuralElement objects."""
+    elements = []
+    for item in elements_data:
+        try:
+            element = StructuralElement(
+                element_type=ElementType(item["element_type"]),
+                label=item.get("label", f"Page {page_idx+1} element"),
+                width=float(item.get("width", 300)),
+                depth=float(item.get("depth", 300)),
+                length=float(item.get("length", 3000)),
+                main_bar_dia=float(item["main_bar_dia"]) if item.get("main_bar_dia") else None,
+                main_bar_count=int(item["main_bar_count"]) if item.get("main_bar_count") else None,
+                top_bar_dia=float(item["top_bar_dia"]) if item.get("top_bar_dia") else None,
+                top_bar_count=int(item["top_bar_count"]) if item.get("top_bar_count") else None,
+                bottom_bar_dia=float(item["bottom_bar_dia"]) if item.get("bottom_bar_dia") else None,
+                bottom_bar_count=int(item["bottom_bar_count"]) if item.get("bottom_bar_count") else None,
+                stirrup_dia=float(item["stirrup_dia"]) if item.get("stirrup_dia") else None,
+                stirrup_spacing=float(item["stirrup_spacing"]) if item.get("stirrup_spacing") else None,
+                quantity=int(item.get("quantity", 1)),
+            )
+            elements.append(element)
+        except (ValueError, KeyError) as e:
+            print(f"Skipping element: {e}")
+            continue
+    return elements
+
+
+def _deduplicate_elements(elements: list[StructuralElement]) -> list[StructuralElement]:
+    """Remove duplicate elements that may have been detected across multiple pages."""
+    seen = {}
+    unique = []
+
+    for elem in elements:
+        # Create a key based on type + dimensions + label
+        key = (
+            elem.element_type,
+            elem.label,
+            elem.width,
+            elem.depth,
+        )
+        if key not in seen:
+            seen[key] = elem
+            unique.append(elem)
+        else:
+            # If same element found again, keep the one with more detail
+            existing = seen[key]
+            if elem.main_bar_dia and not existing.main_bar_dia:
+                seen[key] = elem
+                unique[unique.index(existing)] = elem
+
+    return unique
+
+
+def parse_pdf_file(filepath: str) -> DWGParseResult:
+    """
+    Parse a PDF structural drawing file.
+    Extracts text and prepares images for LLM vision analysis.
+    """
+    pages = render_pdf_pages(filepath, dpi=200)
+
+    all_text = []
+    all_annotations = {
+        "dimensions": [],
+        "bar_specs": [],
+        "spacings": [],
+        "labels": [],
+    }
+
+    for img_bytes, page_text in pages:
+        text_info = extract_text_annotations(page_text)
+        all_text.extend(text_info["all_text"])
+        all_annotations["dimensions"].extend(text_info["dimensions"])
+        all_annotations["bar_specs"].extend(text_info["bar_specs"])
+        all_annotations["spacings"].extend(text_info["spacings"])
+        all_annotations["labels"].extend(text_info["labels"])
+
+    # Try to detect elements from text alone first
+    elements_detected = _detect_elements_from_text(all_text)
+
+    metadata = {
+        "total_layers": 0,
+        "structural_layers": [],
+        "total_entities": 0,
+        "file_format": "PDF",
+        "parse_method": "pdf_vision",
+        "page_count": len(pages),
+        "dimensions_found": list(set(all_annotations["dimensions"]))[:30],
+        "bar_specs_found": list(set(all_annotations["bar_specs"]))[:30],
+        "labels_found": list(set(all_annotations["labels"]))[:30],
+    }
+
+    # Deduplicate text
+    unique_text = list(dict.fromkeys(all_text))
+
+    return DWGParseResult(
+        filename=os.path.basename(filepath),
+        layers=list(set(all_annotations["labels"])),
+        element_count=len(elements_detected),
+        elements_detected=elements_detected,
+        raw_text_annotations=unique_text[:200],
+        metadata=metadata,
+    )
+
+
+def _detect_elements_from_text(text_lines: list[str]) -> list[StructuralElement]:
+    """Try to detect structural elements from extracted PDF text."""
+    elements = []
+
+    dim_pattern = re.compile(r"(\d{2,4})\s*[xX×]\s*(\d{2,4})(?:\s*[xX×]\s*(\d{2,5}))?")
+    bar_pattern = re.compile(r"(\d{1,2})\s*[-#]?\s*(\d{2,3})\s*(?:mm|dia|φ|Φ|ø)")
+    spacing_pattern = re.compile(r"(?:@|c/c|c\.c)\s*(\d{2,3})")
+
+    for line in text_lines:
+        dims = dim_pattern.search(line)
+        bars = bar_pattern.search(line)
+        spacing = spacing_pattern.search(line)
+
+        if dims:
+            w = float(dims.group(1))
+            d = float(dims.group(2))
+            l = float(dims.group(3)) if dims.group(3) else None
+
+            if w < 50 or d < 50:  # Too small to be structural
+                continue
+
+            line_lower = line.lower()
+            if any(k in line_lower for k in ["col", "column"]):
+                elem_type = ElementType.COLUMN
+            elif any(k in line_lower for k in ["beam", "bm"]):
+                elem_type = ElementType.BEAM
+            elif any(k in line_lower for k in ["slab"]):
+                elem_type = ElementType.SLAB
+            elif any(k in line_lower for k in ["foot", "found"]):
+                elem_type = ElementType.FOOTING
+            elif any(k in line_lower for k in ["stair"]):
+                elem_type = ElementType.STAIRCASE
+            elif any(k in line_lower for k in ["lintel"]):
+                elem_type = ElementType.LINTEL
+            else:
+                continue  # Skip ambiguous without context
+
+            element = StructuralElement(
+                element_type=elem_type,
+                label=line[:50],
+                width=w,
+                depth=d,
+                length=l * 1000 if l else 3000,
+                main_bar_dia=float(bars.group(2)) if bars else None,
+                main_bar_count=int(bars.group(1)) if bars else None,
+                stirrup_spacing=float(spacing.group(1)) if spacing else None,
+            )
+            elements.append(element)
+
+    return elements
