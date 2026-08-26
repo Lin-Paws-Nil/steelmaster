@@ -100,19 +100,11 @@ async def interpret_drawing_with_llm(
 **Elements already detected by automated parser ({len(parse_result.elements_detected)}):**
 {json.dumps([e.model_dump() for e in parse_result.elements_detected[:30]], indent=2) if parse_result.elements_detected else "None - automated parsing could not detect elements from this DWG binary"}
 
-IMPORTANT: The automated parser may have missed many elements, especially internal beams. 
-Based on the drawing information above, provide a COMPLETE list of ALL structural elements.
-If the automated parser found some elements, use those as a starting point but ADD any missing ones.
-If no elements were detected, infer from the layer names, block names, and text annotations what the building contains.
-
-For a typical building plan, ensure you include:
-- ALL peripheral beams (along the outer walls)
-- ALL internal beams (connecting internal columns, in BOTH X and Y directions)
-- Plinth beams (at plinth level)
-- Lintel beams (over doors and windows)
-- All columns
-- All slab panels
-- All footings (one per column typically)"""
+IMPORTANT: ONLY report elements you can identify from the data above.
+- Do NOT invent or infer elements that are not clearly indicated in the text annotations, layer names, or block names.
+- If the drawing only shows beams, report ONLY beams. Do NOT add columns, slabs, or footings unless they are explicitly mentioned in the annotations.
+- If reinforcement details (bar count, diameter, stirrup spacing) are not readable from the annotations, set those fields to null.
+- The label should be the exact label from the drawing (e.g., "B1", "B9", "B19") — do NOT add descriptions like "Main Beam" or "Internal Beam"."""
 
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -239,16 +231,13 @@ Detected elements:
 {context_info}
 
 Please:
-1. Fill in any missing reinforcement details (main_bar_dia, main_bar_count, stirrup_dia, stirrup_spacing) using engineering judgment
-2. CRITICALLY - identify any MISSING elements that a building of this type would typically have:
-   - Are there internal beams connecting internal columns? (usually missed)
-   - Are there plinth beams at foundation level?
-   - Are there lintel beams over openings?
-   - Does the footing count match the column count?
-   - Are all slab panels accounted for?
-3. Return the COMPLETE list including both existing (corrected) and newly identified elements
+1. Verify the detected elements against the drawing context - remove any that don't appear in the actual data.
+2. If reinforcement details are clearly readable from the text annotations, fill them in.
+3. Do NOT add elements that are not in the drawing. Do NOT invent columns, slabs, or footings.
+4. Do NOT fill in reinforcement with "typical" or "standard" values — only use values from the actual annotations.
+5. Return ONLY the elements that are actually present in the drawing data.
 
-Return a JSON object with key "elements" containing the full array."""
+Return a JSON object with key "elements" containing the verified array."""
 
     headers = {
         "Authorization": f"Bearer {api_key}",
