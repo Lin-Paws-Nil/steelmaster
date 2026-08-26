@@ -189,10 +189,39 @@ async def upload_and_estimate(file: UploadFile = File(...), use_llm: bool = Fals
             elements=elements,
         )
     except ValueError as e:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Steel estimation failed: {str(e)}"
-        )
+        # Estimation failed — return the parsed elements with error detail
+        # so the frontend can show what was found and what's missing
+        missing_fields = []
+        for elem in elements:
+            issues = []
+            if not elem.length:
+                issues.append("span/length")
+            if not elem.main_bar_dia and not elem.bottom_bar_dia and not elem.reinforcement_detail:
+                issues.append("reinforcement")
+            if not elem.stirrup_dia and not elem.stirrup_spacing and not (elem.reinforcement_detail and (elem.reinforcement_detail.stirrup_end_zone or elem.reinforcement_detail.stirrup_mid_zone or elem.reinforcement_detail.stirrup_support_zone)):
+                issues.append("stirrups")
+            if issues:
+                missing_fields.append(f"{elem.label}: missing {', '.join(issues)}")
+
+        return {
+            "parse_result": parse_result,
+            "estimate": None,
+            "elements_found": [
+                {
+                    "label": e.label,
+                    "type": e.element_type.value,
+                    "width": e.width,
+                    "depth": e.depth,
+                    "length": e.length,
+                    "has_reinforcement": bool(e.main_bar_dia or e.bottom_bar_dia or e.reinforcement_detail),
+                    "has_stirrups": bool(e.stirrup_dia or (e.reinforcement_detail and (e.reinforcement_detail.stirrup_end_zone or e.reinforcement_detail.stirrup_mid_zone))),
+                }
+                for e in elements
+            ],
+            "message": f"Found {len(elements)} elements but cannot estimate steel — missing required data.",
+            "missing_data": missing_fields,
+            "error": str(e),
+        }
 
     return {
         "parse_result": parse_result,
