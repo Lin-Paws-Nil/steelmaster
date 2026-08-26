@@ -40,7 +40,8 @@ DWG_READER_PROJECT = BASE_DIR / "tools" / "dwg-reader"
 BEAM_PATTERN = re.compile(r"B\d+[a-z]?\((\d+)[xX](\d+)\)")
 COLUMN_PATTERN = re.compile(r"C(\d+)")
 BAR_SPEC_PATTERN = re.compile(r"(\d+)[KkNn#](\d+)")
-STIRRUP_PATTERN = re.compile(r"(\d+)[Ll]-[Kk](\d+)@(\d+)[Cc]/[Cc]")
+STIRRUP_LEGGED_PATTERN = re.compile(r"(\d+)[Ll]-?[Kk](\d+)@(\d+)[Cc]/[Cc]")
+STIRRUP_SIMPLE_PATTERN = re.compile(r"[Kk](\d+)@(\d+)[Cc]/[Cc]")
 SPACING_PATTERN = re.compile(r"@(\d+)[Cc]/[Cc]")
 
 
@@ -144,6 +145,11 @@ def _extract_elements_from_data(data: dict) -> list[StructuralElement]:
     texts = data.get("textEntities", [])
     dimensions = data.get("dimensions", [])
 
+    print(f"[ACadSharp] {len(texts)} text entities, {len(dimensions)} dimensions")
+    # Log sample text annotations for debugging
+    sample_texts = [t.get("text", "") for t in texts[:30]]
+    print(f"[ACadSharp] Sample texts: {sample_texts}")
+
     # Group texts by their content patterns
     beam_labels = {}  # beam_name -> (width, depth)
     column_labels = set()
@@ -152,13 +158,16 @@ def _extract_elements_from_data(data: dict) -> list[StructuralElement]:
     spacings = []
 
     for t in texts:
-        text = t.get("text", "")
+        text = t.get("text", "").strip()
         layer = t.get("layer", "")
+
+        if not text:
+            continue
 
         # Beam labels with dimensions: B1(230X600)
         beam_match = BEAM_PATTERN.search(text)
         if beam_match:
-            beam_name = text.split("(")[0]
+            beam_name = text.split("(")[0].strip()
             width = float(beam_match.group(1))
             depth = float(beam_match.group(2))
             beam_labels[beam_name] = (width, depth)
@@ -169,16 +178,8 @@ def _extract_elements_from_data(data: dict) -> list[StructuralElement]:
             column_labels.add(text)
             continue
 
-        # Bar specifications: 2K25, 4K16, 6K12
-        bar_match = BAR_SPEC_PATTERN.match(text)
-        if bar_match:
-            count = int(bar_match.group(1))
-            dia = float(bar_match.group(2))
-            bar_specs.append((count, dia))
-            continue
-
-        # Stirrup specs: 4L-K8@150C/C, 6L-K8@125C/C
-        stirrup_match = STIRRUP_PATTERN.match(text)
+        # Stirrup specs (legged): 4L-K8@150C/C, 6L-K8@125C/C
+        stirrup_match = STIRRUP_LEGGED_PATTERN.search(text)
         if stirrup_match:
             legs = int(stirrup_match.group(1))
             dia = float(stirrup_match.group(2))
@@ -186,12 +187,37 @@ def _extract_elements_from_data(data: dict) -> list[StructuralElement]:
             stirrup_specs.append((legs, dia, spacing))
             continue
 
+        # Stirrup specs (simple): K8@150C/C, K10@130C/C
+        stirrup_simple_match = STIRRUP_SIMPLE_PATTERN.search(text)
+        if stirrup_simple_match:
+            dia = float(stirrup_simple_match.group(1))
+            spacing = float(stirrup_simple_match.group(2))
+            stirrup_specs.append((2, dia, spacing))
+            continue
+
+        # Bar specifications: 2K25, 4K16, 6K12 (use .search() not .match())
+        bar_match = BAR_SPEC_PATTERN.search(text)
+        if bar_match:
+            count = int(bar_match.group(1))
+            dia = float(bar_match.group(2))
+            bar_specs.append((count, dia))
+            continue
+
         # Spacing only: @150C/C
-        spacing_match = SPACING_PATTERN.match(text)
+        spacing_match = SPACING_PATTERN.search(text)
         if spacing_match:
             spacings.append(float(spacing_match.group(1)))
 
     # Determine common stirrup spec from what's actually in the drawing
+    print(f"[ACadSharp] Parsed: {len(beam_labels)} beams, {len(bar_specs)} bar specs, "
+          f"{len(stirrup_specs)} stirrups, {len(spacings)} spacings, {len(column_labels)} columns")
+    if bar_specs:
+        print(f"[ACadSharp] Bar specs found: {bar_specs[:10]}")
+    if stirrup_specs:
+        print(f"[ACadSharp] Stirrup specs found: {stirrup_specs[:10]}")
+    if dim_values := [d["measurement"] for d in dimensions if d.get("measurement", 0) > 500]:
+        print(f"[ACadSharp] Dimension values > 500mm: {dim_values[:10]}")
+
     common_stirrup_dia = None
     common_stirrup_spacing = None
     if stirrup_specs:
