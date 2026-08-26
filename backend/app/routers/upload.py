@@ -183,6 +183,17 @@ async def upload_and_estimate(file: UploadFile = File(...), use_llm: bool = Fals
             detail="No structural elements could be detected from this file. Ensure the drawing contains readable structural annotations."
         )
 
+    # Debug: print what was extracted for each element
+    print(f"[Upload] {len(elements)} elements found. Details:")
+    for elem in elements:
+        print(f"  {elem.label} | type={elem.element_type.value} | "
+              f"dims={elem.width}x{elem.depth} | length={elem.length} | "
+              f"main_bar={elem.main_bar_dia}/{elem.main_bar_count} | "
+              f"bottom={elem.bottom_bar_dia}/{elem.bottom_bar_count} | "
+              f"top={elem.top_bar_dia}/{elem.top_bar_count} | "
+              f"stirrup={elem.stirrup_dia}@{elem.stirrup_spacing} | "
+              f"has_detail={elem.reinforcement_detail is not None}")
+
     try:
         estimate = estimate_project(
             project_name=file.filename or "Unnamed Project",
