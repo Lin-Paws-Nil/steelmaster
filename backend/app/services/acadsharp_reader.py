@@ -37,12 +37,14 @@ def _resolve_dotnet_path() -> str:
 DOTNET_PATH = _resolve_dotnet_path()
 DWG_READER_PROJECT = BASE_DIR / "tools" / "dwg-reader"
 
-BEAM_PATTERN = re.compile(r"B\d+[a-z]?\((\d+)[xX](\d+)\)")
+BEAM_PATTERN = re.compile(r"B(\d+)[a-zA-Z]?\((\d+\"?)\s*[xX]\s*(\d+\"?)\)")
 COLUMN_PATTERN = re.compile(r"C(\d+)")
 BAR_SPEC_PATTERN = re.compile(r"(\d+)[KkNn#](\d+)")
-STIRRUP_LEGGED_PATTERN = re.compile(r"(\d+)[Ll]-?[Kk](\d+)@(\d+)[Cc]/[Cc]")
-STIRRUP_SIMPLE_PATTERN = re.compile(r"[Kk](\d+)@(\d+)[Cc]/[Cc]")
-SPACING_PATTERN = re.compile(r"@(\d+)[Cc]/[Cc]")
+STIRRUP_LEGGED_PATTERN = re.compile(r"(\d+)[Ll]-?[Kk](\d+)@(\d+)\"?[Cc]/[Cc]")
+STIRRUP_SIMPLE_PATTERN = re.compile(r"[Kk](\d+)@(\d+)\"?[Cc]/[Cc]")
+SPACING_PATTERN = re.compile(r"@(\d+)\"?[Cc]/[Cc]")
+
+INCH_TO_MM = 25.4
 
 
 def _get_dotnet_env():
@@ -164,12 +166,24 @@ def _extract_elements_from_data(data: dict) -> list[StructuralElement]:
         if not text:
             continue
 
-        # Beam labels with dimensions: B1(230X600)
+        # Beam labels with dimensions: B1(230X600) or B1(8"X18")
         beam_match = BEAM_PATTERN.search(text)
         if beam_match:
-            beam_name = text.split("(")[0].strip()
-            width = float(beam_match.group(1))
-            depth = float(beam_match.group(2))
+            beam_num = beam_match.group(1)
+            w_str = beam_match.group(2)
+            d_str = beam_match.group(3)
+
+            # Convert inches to mm if " present
+            if '"' in w_str:
+                width = float(w_str.replace('"', '')) * INCH_TO_MM
+            else:
+                width = float(w_str)
+            if '"' in d_str:
+                depth = float(d_str.replace('"', '')) * INCH_TO_MM
+            else:
+                depth = float(d_str)
+
+            beam_name = f"B{beam_num}"
             beam_labels[beam_name] = (width, depth)
             continue
 
@@ -178,21 +192,26 @@ def _extract_elements_from_data(data: dict) -> list[StructuralElement]:
             column_labels.add(text)
             continue
 
-        # Stirrup specs (legged): 4L-K8@150C/C, 6L-K8@125C/C
+        # Stirrup specs (legged): 4L-K8@150C/C or 4L-K8@6"C/C
         stirrup_match = STIRRUP_LEGGED_PATTERN.search(text)
         if stirrup_match:
             legs = int(stirrup_match.group(1))
             dia = float(stirrup_match.group(2))
-            spacing = float(stirrup_match.group(3))
-            stirrup_specs.append((legs, dia, spacing))
+            spacing_val = float(stirrup_match.group(3))
+            # Convert if inches (value < 20 is likely inches)
+            if spacing_val < 20:
+                spacing_val = spacing_val * INCH_TO_MM
+            stirrup_specs.append((legs, dia, spacing_val))
             continue
 
-        # Stirrup specs (simple): K8@150C/C, K10@130C/C
+        # Stirrup specs (simple): K8@150C/C or K8@6"C/C
         stirrup_simple_match = STIRRUP_SIMPLE_PATTERN.search(text)
         if stirrup_simple_match:
             dia = float(stirrup_simple_match.group(1))
-            spacing = float(stirrup_simple_match.group(2))
-            stirrup_specs.append((2, dia, spacing))
+            spacing_val = float(stirrup_simple_match.group(2))
+            if spacing_val < 20:
+                spacing_val = spacing_val * INCH_TO_MM
+            stirrup_specs.append((2, dia, spacing_val))
             continue
 
         # Bar specifications: 2K25, 4K16, 6K12 (use .search() not .match())
@@ -203,10 +222,13 @@ def _extract_elements_from_data(data: dict) -> list[StructuralElement]:
             bar_specs.append((count, dia))
             continue
 
-        # Spacing only: @150C/C
+        # Spacing only: @150C/C or @6"C/C
         spacing_match = SPACING_PATTERN.search(text)
         if spacing_match:
-            spacings.append(float(spacing_match.group(1)))
+            spacing_val = float(spacing_match.group(1))
+            if spacing_val < 20:
+                spacing_val = spacing_val * INCH_TO_MM
+            spacings.append(spacing_val)
 
     # Determine common stirrup spec from what's actually in the drawing
     print(f"[ACadSharp] Parsed: {len(beam_labels)} beams, {len(bar_specs)} bar specs, "
@@ -215,8 +237,19 @@ def _extract_elements_from_data(data: dict) -> list[StructuralElement]:
         print(f"[ACadSharp] Bar specs found: {bar_specs[:10]}")
     if stirrup_specs:
         print(f"[ACadSharp] Stirrup specs found: {stirrup_specs[:10]}")
-    if dim_values := [d["measurement"] for d in dimensions if d.get("measurement", 0) > 500]:
-        print(f"[ACadSharp] Dimension values > 500mm: {dim_values[:10]}")
+
+    # Get span from dimensions — convert inches to mm if needed
+    dim_values = []
+    for d in dimensions:
+        val = d.get("measurement", 0)
+        if val > 500:
+            dim_values.append(val)
+        elif 10 < val < 500:
+            # Likely in inches — convert
+            dim_values.append(val * INCH_TO_MM)
+
+    if dim_values:
+        print(f"[ACadSharp] Dimension values (mm): {[round(v) for v in dim_values[:10]]}")
 
     common_stirrup_dia = None
     common_stirrup_spacing = None
@@ -235,8 +268,9 @@ def _extract_elements_from_data(data: dict) -> list[StructuralElement]:
         common_main_count = count_counter.most_common(1)[0][0]
 
     # Calculate average beam span from dimensions (only if dimensions exist)
-    dim_values = [d["measurement"] for d in dimensions if d["measurement"] > 500]
     avg_span = sum(dim_values) / len(dim_values) if dim_values else None
+    if avg_span:
+        print(f"[ACadSharp] Average span: {round(avg_span)}mm")
 
     # Create beam elements — use only data actually found in the drawing
     for beam_name, (width, depth) in beam_labels.items():
