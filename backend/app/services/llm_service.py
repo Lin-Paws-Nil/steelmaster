@@ -25,43 +25,39 @@ Given information extracted from a structural drawing (AutoCAD DWG/DXF file), yo
 
 IMPORTANT RULES:
 - You MUST identify EVERY beam, column, slab, footing, staircase, and lintel in the drawing
-- A typical residential building has: 8-20 columns, 15-40 beams (including internal/secondary beams), 4-10 slab panels, 8-20 footings
 - Internal beams (connecting internal columns), secondary beams, lintel beams, and plinth beams are often missed - include ALL of them
 - If the drawing shows a grid of columns, there are beams connecting them in BOTH directions
 - Count beams at each floor level separately
 - For multi-storey buildings, multiply columns and beams by number of floors
 
-For each element, determine:
+For each element, determine FROM THE DRAWING DATA:
 1. Element type (column, beam, slab, footing, staircase, lintel, wall)
 2. Dimensions (width x depth x length/span in mm)
 3. Main bar specification (count and diameter)
 4. Stirrup/tie specification (diameter and spacing)
 5. Quantity of that element in the drawing
 
-Use standard Indian construction practices (IS 456:2000) as defaults when info is missing:
-- Columns: typical 230x230 to 600x600, 4-8 bars of 12-25mm, 8mm ties @150-200mm
-- Beams: typical 230x300 to 300x600, 3-6 bars of 12-20mm, 8mm stirrups @150-200mm
-- Plinth beams: typical 230x300, 4 bars of 12mm, 8mm stirrups @150mm
-- Internal beams: same as main beams but may be smaller (230x300 to 230x450)
-- Slabs: typical 125-150mm thick, 10-12mm bars @150mm, 8mm distribution @200mm
-- Footings: typical 1000x1000 to 2000x2000, depth 300-600mm, 12-16mm bars @150mm
-- Lintels: typical 230x200 to 230x300 over openings, 4 bars of 12mm
+CRITICAL: Only report values you can actually read from the drawing data provided.
+- If dimensions are not visible, set width/depth/length to null
+- If reinforcement is not visible, set main_bar_dia/main_bar_count/stirrup_dia/stirrup_spacing to null
+- Do NOT invent or assume values. Do NOT use "typical" or "standard" values as substitutes.
+- It is better to return null for a field than to guess.
 
 Output a JSON object with key "elements" containing an array. Each element must have:
 {
   "element_type": "column|beam|slab|footing|staircase|lintel|wall",
-  "label": "descriptive label (e.g. B1 - Main Beam, B2 - Internal Beam)",
-  "width": number_in_mm,
-  "depth": number_in_mm,
-  "length": number_in_mm,
-  "main_bar_dia": number_in_mm,
-  "main_bar_count": number,
-  "stirrup_dia": number_in_mm,
-  "stirrup_spacing": number_in_mm,
+  "label": "exact label from drawing (e.g. B1, B2, C1)",
+  "width": number_in_mm_or_null,
+  "depth": number_in_mm_or_null,
+  "length": number_in_mm_or_null,
+  "main_bar_dia": number_in_mm_or_null,
+  "main_bar_count": number_or_null,
+  "stirrup_dia": number_in_mm_or_null,
+  "stirrup_spacing": number_in_mm_or_null,
   "quantity": number
 }
 
-Be THOROUGH - it is better to include more elements than to miss them. A typical G+1 residential building should have at minimum 40-60 total structural elements across all types."""
+Only include elements you can clearly identify from the provided drawing data."""
 
 
 async def interpret_drawing_with_llm(
@@ -159,12 +155,16 @@ For a typical building plan, ensure you include:
             elements = []
             for item in elements_data:
                 try:
+                    if not item.get("width") or not item.get("depth"):
+                        print(f"Skipping element '{item.get('label', '?')}': missing dimensions")
+                        continue
+
                     element = StructuralElement(
                         element_type=ElementType(item["element_type"]),
                         label=item.get("label", "Unknown"),
-                        width=float(item.get("width", 300)),
-                        depth=float(item.get("depth", 300)),
-                        length=float(item.get("length", 3000)),
+                        width=float(item["width"]),
+                        depth=float(item["depth"]),
+                        length=float(item["length"]) if item.get("length") else None,
                         main_bar_dia=float(item["main_bar_dia"]) if item.get("main_bar_dia") else None,
                         main_bar_count=int(item["main_bar_count"]) if item.get("main_bar_count") else None,
                         top_bar_dia=float(item["top_bar_dia"]) if item.get("top_bar_dia") else None,
@@ -289,12 +289,15 @@ Return a JSON object with key "elements" containing the full array."""
             result = []
             for item in enhanced_data:
                 try:
+                    if not item.get("width") or not item.get("depth"):
+                        continue
+
                     element = StructuralElement(
                         element_type=ElementType(item["element_type"]),
                         label=item.get("label", "Unknown"),
-                        width=float(item.get("width", 300)),
-                        depth=float(item.get("depth", 300)),
-                        length=float(item.get("length", 3000)),
+                        width=float(item["width"]),
+                        depth=float(item["depth"]),
+                        length=float(item["length"]) if item.get("length") else None,
                         main_bar_dia=float(item["main_bar_dia"]) if item.get("main_bar_dia") else None,
                         main_bar_count=int(item["main_bar_count"]) if item.get("main_bar_count") else None,
                         top_bar_dia=float(item["top_bar_dia"]) if item.get("top_bar_dia") else None,
