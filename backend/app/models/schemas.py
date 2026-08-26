@@ -47,7 +47,7 @@ class StructuralElement(BaseModel):
     label: str
     width: float  # mm
     depth: float  # mm
-    length: float  # mm (or span)
+    length: Optional[float] = None  # mm (or span) — None means not extracted
     clear_cover: float = 25.0  # mm
     concrete_grade: str = "M20"
     steel_grade: str = "Fe500"

@@ -507,14 +507,14 @@ def parse_dxf_file(filepath: str) -> DWGParseResult:
             elif any(k in text_lower for k in ["foot", "found"]):
                 elem_type = ElementType.FOOTING
             else:
-                elem_type = ElementType.BEAM
+                continue  # Skip ambiguous elements without clear type
 
             element = StructuralElement(
                 element_type=elem_type,
                 label=text[:50],
                 width=dims[0],
                 depth=dims[1],
-                length=dims[2] * 1000 if dims[2] else 3000,
+                length=dims[2] * 1000 if dims[2] else None,
                 main_bar_dia=bar_spec[1] if bar_spec else None,
                 main_bar_count=bar_spec[0] if bar_spec else None,
                 stirrup_spacing=spacing,
@@ -530,7 +530,7 @@ def parse_dxf_file(filepath: str) -> DWGParseResult:
                         label=f"{elem_type.value.title()} (from geometry)",
                         width=geom[0],
                         depth=geom[1],
-                        length=3000,
+                        length=None,
                     )
                     elements_detected.append(element)
 
@@ -692,14 +692,14 @@ def _parse_dwg_binary_fallback(filepath: str) -> DWGParseResult:
             elif any(k in text_lower for k in ["lintel"]):
                 elem_type = ElementType.LINTEL
             else:
-                elem_type = ElementType.BEAM
+                continue  # Skip ambiguous elements without clear type
 
             element = StructuralElement(
                 element_type=elem_type,
                 label=text[:50],
                 width=dims[0],
                 depth=dims[1],
-                length=dims[2] * 1000 if dims[2] else 3000,
+                length=dims[2] * 1000 if dims[2] else None,
                 main_bar_dia=bar_spec[1] if bar_spec else None,
                 main_bar_count=bar_spec[0] if bar_spec else None,
                 stirrup_spacing=spacing,

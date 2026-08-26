@@ -183,10 +183,16 @@ async def upload_and_estimate(file: UploadFile = File(...), use_llm: bool = Fals
             detail="No structural elements could be detected from this file. Ensure the drawing contains readable structural annotations."
         )
 
-    estimate = estimate_project(
-        project_name=file.filename or "Unnamed Project",
-        elements=elements,
-    )
+    try:
+        estimate = estimate_project(
+            project_name=file.filename or "Unnamed Project",
+            elements=elements,
+        )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Steel estimation failed: {str(e)}"
+        )
 
     return {
         "parse_result": parse_result,

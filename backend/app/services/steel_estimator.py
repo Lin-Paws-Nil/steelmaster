@@ -96,12 +96,21 @@ def estimate_column(element: StructuralElement) -> list[RebarSpec]:
 
     width = element.width
     depth = element.depth
-    length = element.length  # floor height
-    cover = defaults["clear_cover"]  # Always 40mm for columns
+    length = element.length
+    cover = defaults["clear_cover"]
+
+    if not length:
+        raise ValueError(f"Cannot estimate column '{element.label}': height/length is not provided.")
 
     # Main bars
-    main_dia = element.main_bar_dia or defaults["main_bar_dia"]
-    main_count = element.main_bar_count or defaults["main_bar_count"]
+    main_dia = element.main_bar_dia
+    main_count = element.main_bar_count
+
+    if not main_dia or not main_count:
+        raise ValueError(
+            f"Cannot estimate column '{element.label}': no reinforcement data provided "
+            f"(need main_bar_dia and main_bar_count)."
+        )
 
     # Bar length = column height + lap length (one lap per storey)
     lap_length = LAP_LENGTH_FACTOR * main_dia / 1000  # in meters
@@ -120,8 +129,14 @@ def estimate_column(element: StructuralElement) -> list[RebarSpec]:
     ))
 
     # Stirrups / Ties
-    stirrup_dia = element.stirrup_dia or defaults["stirrup_dia"]
-    stirrup_spacing = element.stirrup_spacing or defaults["stirrup_spacing"]
+    stirrup_dia = element.stirrup_dia
+    stirrup_spacing = element.stirrup_spacing
+
+    if not stirrup_dia or not stirrup_spacing:
+        raise ValueError(
+            f"Cannot estimate column '{element.label}': no stirrup data provided "
+            f"(need stirrup_dia and stirrup_spacing)."
+        )
 
     # Stirrup perimeter = 2(width + depth) - 8*cover + hooks
     stirrup_perimeter = 2 * ((width - 2 * cover) + (depth - 2 * cover))
@@ -156,6 +171,9 @@ def estimate_beam(element: StructuralElement) -> list[RebarSpec]:
     span = element.length
     cover = element.clear_cover or defaults["clear_cover"]
 
+    if not span:
+        raise ValueError(f"Cannot estimate beam '{element.label}': span/length is not provided.")
+
     detail = element.reinforcement_detail
 
     # If we have detailed reinforcement data, use zone-based calculation
@@ -164,9 +182,7 @@ def estimate_beam(element: StructuralElement) -> list[RebarSpec]:
         if rebars:
             return rebars
 
-    # Fallback: standard calculation from top-level fields
-    # Determine bottom and top bar specs separately
-    # Priority: explicit top/bottom fields > main_bar fields > defaults
+    # Standard calculation from top-level fields
     if element.bottom_bar_dia and element.bottom_bar_count:
         bottom_dia = element.bottom_bar_dia
         bottom_count = element.bottom_bar_count
@@ -174,22 +190,25 @@ def estimate_beam(element: StructuralElement) -> list[RebarSpec]:
         bottom_dia = element.main_bar_dia
         bottom_count = element.main_bar_count
     else:
-        bottom_dia = defaults["main_bar_dia"]
-        bottom_count = max(2, defaults["main_bar_count"] // 2)
+        raise ValueError(
+            f"Cannot estimate beam '{element.label}': no reinforcement data provided "
+            f"(need bottom_bar_dia/count or main_bar_dia/count)."
+        )
 
     if element.top_bar_dia and element.top_bar_count:
         top_dia = element.top_bar_dia
         top_count = element.top_bar_count
     elif element.main_bar_dia and element.main_bar_count and not element.bottom_bar_dia:
-        # Legacy mode: split main bars 60/40
         total = element.main_bar_count
         bottom_count = max(1, math.ceil(total * 0.6))
         top_count = max(1, total - bottom_count)
         top_dia = element.main_bar_dia
         bottom_dia = element.main_bar_dia
     else:
-        top_dia = defaults["main_bar_dia"]
-        top_count = max(2, defaults["main_bar_count"] // 2)
+        raise ValueError(
+            f"Cannot estimate beam '{element.label}': no top bar data provided "
+            f"(need top_bar_dia/count or main_bar_dia/count)."
+        )
 
     # Bottom bars: full span + development length on each side
     dev_length_bottom = LAP_LENGTH_FACTOR * bottom_dia / 1000
@@ -234,8 +253,14 @@ def estimate_beam(element: StructuralElement) -> list[RebarSpec]:
     ))
 
     # Stirrups
-    stirrup_dia = element.stirrup_dia or defaults["stirrup_dia"]
-    stirrup_spacing = element.stirrup_spacing or defaults["stirrup_spacing"]
+    stirrup_dia = element.stirrup_dia
+    stirrup_spacing = element.stirrup_spacing
+
+    if not stirrup_dia or not stirrup_spacing:
+        raise ValueError(
+            f"Cannot estimate beam '{element.label}': no stirrup data provided "
+            f"(need stirrup_dia and stirrup_spacing)."
+        )
 
     stirrup_perimeter = 2 * ((width - 2 * cover) + (depth - 2 * cover))
     hook_addition = 2 * HOOK_LENGTH * stirrup_dia
@@ -267,6 +292,9 @@ def _estimate_beam_detailed(element: StructuralElement, detail) -> list[RebarSpe
     width = element.width
     depth = element.depth
     cover = element.clear_cover or 25.0
+
+    if not span:
+        raise ValueError(f"Cannot estimate beam '{element.label}': span/length is not provided.")
 
     # --- Bottom straight bars (full span) ---
     if detail.bottom_straight:
@@ -607,18 +635,17 @@ def estimate_staircase(element: StructuralElement) -> list[RebarSpec]:
 
 def estimate_lintel(element: StructuralElement) -> list[RebarSpec]:
     """Estimate steel for a lintel beam."""
-    defaults = DEFAULTS["lintel"]
     return estimate_beam(StructuralElement(
         element_type=ElementType.LINTEL,
         label=element.label,
-        width=element.width or 230,
-        depth=element.depth or 200,
+        width=element.width,
+        depth=element.depth,
         length=element.length,
-        clear_cover=element.clear_cover or defaults["clear_cover"],
-        main_bar_dia=element.main_bar_dia or defaults["main_bar_dia"],
-        main_bar_count=element.main_bar_count or defaults["main_bar_count"],
-        stirrup_dia=element.stirrup_dia or defaults["stirrup_dia"],
-        stirrup_spacing=element.stirrup_spacing or defaults["stirrup_spacing"],
+        clear_cover=element.clear_cover,
+        main_bar_dia=element.main_bar_dia,
+        main_bar_count=element.main_bar_count,
+        stirrup_dia=element.stirrup_dia,
+        stirrup_spacing=element.stirrup_spacing,
     ))
 
 
@@ -634,8 +661,14 @@ ESTIMATORS = {
 
 
 def estimate_element(element: StructuralElement) -> SteelEstimate:
-    """Estimate steel for a single structural element."""
-    estimator = ESTIMATORS.get(element.element_type, estimate_beam)
+    """Estimate steel for a single structural element.
+
+    Raises ValueError if the element is missing required data (reinforcement, dimensions).
+    """
+    estimator = ESTIMATORS.get(element.element_type)
+    if not estimator:
+        raise ValueError(f"No estimator available for element type '{element.element_type.value}'")
+
     rebars = estimator(element)
 
     # Apply quantity multiplier
@@ -653,8 +686,27 @@ def estimate_element(element: StructuralElement) -> SteelEstimate:
 
 
 def estimate_project(project_name: str, elements: list[StructuralElement]) -> ProjectEstimate:
-    """Estimate total steel for an entire project."""
-    estimates = [estimate_element(e) for e in elements]
+    """Estimate total steel for an entire project.
+
+    Raises ValueError if any element is missing required data.
+    """
+    estimates = []
+    errors = []
+
+    for e in elements:
+        try:
+            estimates.append(estimate_element(e))
+        except ValueError as err:
+            errors.append(str(err))
+
+    if not estimates:
+        raise ValueError(
+            f"Cannot estimate any elements. All {len(elements)} elements failed:\n"
+            + "\n".join(errors[:10])
+        )
+
+    if errors:
+        print(f"[Estimator] {len(errors)} elements skipped due to missing data: {errors[:5]}")
 
     total_kg = sum(e.total_weight_kg for e in estimates)
 
