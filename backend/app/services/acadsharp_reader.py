@@ -191,63 +191,50 @@ def _extract_elements_from_data(data: dict) -> list[StructuralElement]:
         if spacing_match:
             spacings.append(float(spacing_match.group(1)))
 
-    # Determine common stirrup spec (most common in the drawing)
-    common_stirrup_dia = 8.0
-    common_stirrup_spacing = 150.0
+    # Determine common stirrup spec from what's actually in the drawing
+    common_stirrup_dia = None
+    common_stirrup_spacing = None
     if stirrup_specs:
         dia_counter = Counter(s[1] for s in stirrup_specs)
         spacing_counter = Counter(s[2] for s in stirrup_specs)
         common_stirrup_dia = dia_counter.most_common(1)[0][0]
         common_stirrup_spacing = spacing_counter.most_common(1)[0][0]
 
-    common_main_dia = 16.0
-    common_main_count = 4
+    common_main_dia = None
+    common_main_count = None
     if bar_specs:
         dia_counter = Counter(s[1] for s in bar_specs)
         count_counter = Counter(s[0] for s in bar_specs)
         common_main_dia = dia_counter.most_common(1)[0][0]
         common_main_count = count_counter.most_common(1)[0][0]
 
-    # Calculate average beam span from dimensions
+    # Calculate average beam span from dimensions (only if dimensions exist)
     dim_values = [d["measurement"] for d in dimensions if d["measurement"] > 500]
-    avg_span = sum(dim_values) / len(dim_values) if dim_values else 3000.0
+    avg_span = sum(dim_values) / len(dim_values) if dim_values else None
 
-    # Create beam elements
+    # Create beam elements — use only data actually found in the drawing
     for beam_name, (width, depth) in beam_labels.items():
-        # Try to find specific bar specs for this beam (would need spatial analysis)
-        # For now, assign common specs based on beam size
-        if depth >= 600:
-            main_dia = 25.0
-            main_count = 4
-        elif depth >= 450:
-            main_dia = 20.0
-            main_count = 4
-        else:
-            main_dia = 16.0
-            main_count = 4
-
         elements.append(StructuralElement(
             element_type=ElementType.BEAM,
-            label=f"{beam_name} ({int(width)}x{int(depth)})",
+            label=beam_name,
             width=width,
             depth=depth,
             length=avg_span,
-            main_bar_dia=main_dia,
-            main_bar_count=main_count,
+            main_bar_dia=common_main_dia,
+            main_bar_count=common_main_count,
             stirrup_dia=common_stirrup_dia,
             stirrup_spacing=common_stirrup_spacing,
             quantity=1,
         ))
 
-    # Create column elements
-    # Determine column size from polylines on column layer
+    # Create column elements only if column labels actually exist in the drawing
     column_polys = [
         p for p in data.get("polylines", [])
         if "column" in p.get("layer", "").lower()
     ]
 
-    col_width = 300.0
-    col_depth = 300.0
+    col_width = None
+    col_depth = None
     if column_polys:
         widths = [p["width"] for p in column_polys if 150 < p["width"] < 1500]
         heights = [p["height"] for p in column_polys if 150 < p["height"] < 1500]
@@ -256,16 +243,16 @@ def _extract_elements_from_data(data: dict) -> list[StructuralElement]:
         if heights:
             col_depth = round(sum(heights) / len(heights))
 
-    if column_labels:
+    if column_labels and col_width and col_depth:
         for col_name in sorted(column_labels):
             elements.append(StructuralElement(
                 element_type=ElementType.COLUMN,
                 label=col_name,
                 width=col_width,
                 depth=col_depth,
-                length=3000,  # typical floor height
+                length=None,
                 main_bar_dia=common_main_dia,
-                main_bar_count=8 if col_width >= 450 else 4,
+                main_bar_count=None,
                 stirrup_dia=common_stirrup_dia,
                 stirrup_spacing=common_stirrup_spacing,
                 quantity=1,

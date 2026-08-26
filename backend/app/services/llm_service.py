@@ -40,8 +40,9 @@ For each element, determine FROM THE DRAWING DATA:
 CRITICAL: Only report values you can actually read from the drawing data provided.
 - If dimensions are not visible, set width/depth/length to null
 - If reinforcement is not visible, set main_bar_dia/main_bar_count/stirrup_dia/stirrup_spacing to null
-- Do NOT invent or assume values. Do NOT use "typical" or "standard" values as substitutes.
-- It is better to return null for a field than to guess.
+- Do NOT invent elements that don't exist in the drawing (no imaginary slabs/footings/columns)
+- However, DO read span/length from dimension annotations in the text (feet-inches like 15'-2" = 4623mm, or mm values)
+- If you see dimension text like "5000", "4500", "6000" near beams, those are span lengths — report them
 
 Output a JSON object with key "elements" containing an array. Each element must have:
 {
