@@ -7,10 +7,10 @@ and geometric entities.
 """
 
 import json
+import math
 import os
 import re
 import subprocess
-from collections import Counter
 from pathlib import Path
 from typing import Optional
 
@@ -74,7 +74,6 @@ def read_dwg_with_acadsharp(filepath: str) -> Optional[dict]:
     """Run the ACadSharp DWG reader and return parsed JSON data."""
     try:
         dll_path = _ensure_built()
-        # Run the pre-built DLL directly (faster than 'dotnet run' which re-checks build)
         result = subprocess.run(
             [f"{DOTNET_PATH}/dotnet", dll_path, filepath],
             capture_output=True,
@@ -103,17 +102,12 @@ def parse_dwg_with_acadsharp(filepath: str) -> Optional[DWGParseResult]:
     if data is None:
         return None
 
-    # Extract layer names
     layers = [l["name"] for l in data.get("layers", [])]
-
-    # Collect all text annotations
     raw_texts = [t["text"] for t in data.get("textEntities", [])]
     unique_texts = list(dict.fromkeys(raw_texts))
 
-    # Parse structural elements
     elements = _extract_elements_from_data(data)
 
-    # Build structural layer list
     structural_layers = [
         l["name"] for l in data.get("layers", [])
         if any(k in l["name"].lower() for k in [
@@ -142,38 +136,33 @@ def parse_dwg_with_acadsharp(filepath: str) -> Optional[DWGParseResult]:
 
 
 def _extract_elements_from_data(data: dict) -> list[StructuralElement]:
-    """Extract structural elements from ACadSharp parsed data."""
+    """Extract structural elements using spatial assignment of bars to nearest beam."""
     elements = []
     texts = data.get("textEntities", [])
     dimensions = data.get("dimensions", [])
 
     print(f"[ACadSharp] {len(texts)} text entities, {len(dimensions)} dimensions")
-    # Log sample text annotations for debugging
     sample_texts = [t.get("text", "") for t in texts[:30]]
     print(f"[ACadSharp] Sample texts: {sample_texts}")
 
-    # Group texts by their content patterns
-    beam_labels = {}  # beam_name -> (width, depth)
-    column_labels = set()
-    bar_specs = []  # (count, diameter)
-    stirrup_specs = []  # (legs, dia, spacing)
-    spacings = []
+    beam_positions: dict[str, tuple[float, float, float, float]] = {}
+    bar_entities: list[tuple[int, float, float, float]] = []
+    stirrup_entities: list[tuple[float, float, float, float]] = []
 
     for t in texts:
         text = t.get("text", "").strip()
-        layer = t.get("layer", "")
+        x = float(t.get("x", 0))
+        y = float(t.get("y", 0))
 
         if not text:
             continue
 
-        # Beam labels with dimensions: B1(230X600) or B1(8"X18")
         beam_match = BEAM_PATTERN.search(text)
         if beam_match:
             beam_num = beam_match.group(1)
             w_str = beam_match.group(2)
             d_str = beam_match.group(3)
 
-            # Convert inches to mm if " present
             if '"' in w_str:
                 width = float(w_str.replace('"', '')) * INCH_TO_MM
             else:
@@ -184,138 +173,111 @@ def _extract_elements_from_data(data: dict) -> list[StructuralElement]:
                 depth = float(d_str)
 
             beam_name = f"B{beam_num}"
-            beam_labels[beam_name] = (width, depth)
+            beam_positions[beam_name] = (x, y, width, depth)
             continue
 
-        # Column labels: C1, C2, etc.
-        if "column" in layer.lower() and COLUMN_PATTERN.match(text):
-            column_labels.add(text)
-            continue
-
-        # Stirrup specs (legged): 4L-K8@150C/C or 4L-K8@6"C/C
         stirrup_match = STIRRUP_LEGGED_PATTERN.search(text)
         if stirrup_match:
-            legs = int(stirrup_match.group(1))
             dia = float(stirrup_match.group(2))
             spacing_val = float(stirrup_match.group(3))
-            # Convert if inches (value < 20 is likely inches)
             if spacing_val < 20:
                 spacing_val = spacing_val * INCH_TO_MM
-            stirrup_specs.append((legs, dia, spacing_val))
+            stirrup_entities.append((dia, spacing_val, x, y))
             continue
 
-        # Stirrup specs (simple): K8@150C/C or K8@6"C/C
         stirrup_simple_match = STIRRUP_SIMPLE_PATTERN.search(text)
         if stirrup_simple_match:
             dia = float(stirrup_simple_match.group(1))
             spacing_val = float(stirrup_simple_match.group(2))
             if spacing_val < 20:
                 spacing_val = spacing_val * INCH_TO_MM
-            stirrup_specs.append((2, dia, spacing_val))
+            stirrup_entities.append((dia, spacing_val, x, y))
             continue
 
-        # Bar specifications: 2K25, 4K16, 6K12 (use .search() not .match())
         bar_match = BAR_SPEC_PATTERN.search(text)
         if bar_match:
             count = int(bar_match.group(1))
             dia = float(bar_match.group(2))
-            bar_specs.append((count, dia))
+            bar_entities.append((count, dia, x, y))
             continue
 
-        # Spacing only: @150C/C or @6"C/C
-        spacing_match = SPACING_PATTERN.search(text)
-        if spacing_match:
-            spacing_val = float(spacing_match.group(1))
-            if spacing_val < 20:
-                spacing_val = spacing_val * INCH_TO_MM
-            spacings.append(spacing_val)
+    print(f"[ACadSharp] Spatial: {len(beam_positions)} beams, "
+          f"{len(bar_entities)} bars, {len(stirrup_entities)} stirrups")
 
-    # Determine common stirrup spec from what's actually in the drawing
-    print(f"[ACadSharp] Parsed: {len(beam_labels)} beams, {len(bar_specs)} bar specs, "
-          f"{len(stirrup_specs)} stirrups, {len(spacings)} spacings, {len(column_labels)} columns")
-    if bar_specs:
-        print(f"[ACadSharp] Bar specs found: {bar_specs[:10]}")
-    if stirrup_specs:
-        print(f"[ACadSharp] Stirrup specs found: {stirrup_specs[:10]}")
+    if not beam_positions:
+        return []
 
-    # Get span from dimensions — convert inches to mm if needed
+    # Get span from dimension entities — use the LARGEST (most likely beam span)
     dim_values = []
     for d in dimensions:
         val = d.get("measurement", 0)
         if val > 500:
             dim_values.append(val)
         elif 10 < val < 500:
-            # Likely in inches — convert
             dim_values.append(val * INCH_TO_MM)
 
-    if dim_values:
-        print(f"[ACadSharp] Dimension values (mm): {[round(v) for v in dim_values[:10]]}")
+    span = max(dim_values) if dim_values else None
+    if span:
+        print(f"[ACadSharp] Span (max dimension): {round(span)}mm")
 
-    common_stirrup_dia = None
-    common_stirrup_spacing = None
-    if stirrup_specs:
-        dia_counter = Counter(s[1] for s in stirrup_specs)
-        spacing_counter = Counter(s[2] for s in stirrup_specs)
-        common_stirrup_dia = dia_counter.most_common(1)[0][0]
-        common_stirrup_spacing = spacing_counter.most_common(1)[0][0]
+    # Spatial assignment: assign bars and stirrups to nearest beam
+    def find_nearest_beam(x: float, y: float) -> str:
+        min_dist = float("inf")
+        nearest = None
+        for bname, (bx, by, _, _) in beam_positions.items():
+            dist = math.hypot(x - bx, y - by)
+            if dist < min_dist:
+                min_dist = dist
+                nearest = bname
+        return nearest
 
-    common_main_dia = None
-    common_main_count = None
-    if bar_specs:
-        dia_counter = Counter(s[1] for s in bar_specs)
-        count_counter = Counter(s[0] for s in bar_specs)
-        common_main_dia = dia_counter.most_common(1)[0][0]
-        common_main_count = count_counter.most_common(1)[0][0]
+    beam_bars: dict[str, list[tuple[int, float]]] = {b: [] for b in beam_positions}
+    beam_stirrups: dict[str, list[tuple[float, float]]] = {b: [] for b in beam_positions}
 
-    # Calculate average beam span from dimensions (only if dimensions exist)
-    avg_span = sum(dim_values) / len(dim_values) if dim_values else None
-    if avg_span:
-        print(f"[ACadSharp] Average span: {round(avg_span)}mm")
+    for count, dia, x, y in bar_entities:
+        nearest = find_nearest_beam(x, y)
+        if nearest:
+            beam_bars[nearest].append((count, dia))
 
-    # Create beam elements — use only data actually found in the drawing
-    for beam_name, (width, depth) in beam_labels.items():
+    for dia, spacing, x, y in stirrup_entities:
+        nearest = find_nearest_beam(x, y)
+        if nearest:
+            beam_stirrups[nearest].append((dia, spacing))
+
+    # Build elements with per-beam reinforcement
+    for beam_name, (bx, by, width, depth) in beam_positions.items():
+        bars = beam_bars.get(beam_name, [])
+        stirrups = beam_stirrups.get(beam_name, [])
+
+        bottom_dia = None
+        bottom_count = None
+        top_dia = None
+        top_count = None
+
+        if bars:
+            bars_sorted = sorted(bars, key=lambda b: b[1], reverse=True)
+            bottom_count, bottom_dia = bars_sorted[0]
+            if len(bars_sorted) > 1 and bars_sorted[-1][1] < bottom_dia:
+                top_count, top_dia = bars_sorted[-1]
+
+        stirrup_dia = stirrups[0][0] if stirrups else None
+        stirrup_spacing = stirrups[0][1] if stirrups else None
+
+        print(f"[ACadSharp] {beam_name}: bars={bars}, stirrup={stirrup_dia}@{stirrup_spacing}")
+
         elements.append(StructuralElement(
             element_type=ElementType.BEAM,
             label=beam_name,
             width=width,
             depth=depth,
-            length=avg_span,
-            main_bar_dia=common_main_dia,
-            main_bar_count=common_main_count,
-            stirrup_dia=common_stirrup_dia,
-            stirrup_spacing=common_stirrup_spacing,
+            length=span,
+            bottom_bar_dia=bottom_dia,
+            bottom_bar_count=bottom_count,
+            top_bar_dia=top_dia,
+            top_bar_count=top_count,
+            stirrup_dia=stirrup_dia,
+            stirrup_spacing=stirrup_spacing,
             quantity=1,
         ))
-
-    # Create column elements only if column labels actually exist in the drawing
-    column_polys = [
-        p for p in data.get("polylines", [])
-        if "column" in p.get("layer", "").lower()
-    ]
-
-    col_width = None
-    col_depth = None
-    if column_polys:
-        widths = [p["width"] for p in column_polys if 150 < p["width"] < 1500]
-        heights = [p["height"] for p in column_polys if 150 < p["height"] < 1500]
-        if widths:
-            col_width = round(sum(widths) / len(widths))
-        if heights:
-            col_depth = round(sum(heights) / len(heights))
-
-    if column_labels and col_width and col_depth:
-        for col_name in sorted(column_labels):
-            elements.append(StructuralElement(
-                element_type=ElementType.COLUMN,
-                label=col_name,
-                width=col_width,
-                depth=col_depth,
-                length=None,
-                main_bar_dia=common_main_dia,
-                main_bar_count=None,
-                stirrup_dia=common_stirrup_dia,
-                stirrup_spacing=common_stirrup_spacing,
-                quantity=1,
-            ))
 
     return elements
